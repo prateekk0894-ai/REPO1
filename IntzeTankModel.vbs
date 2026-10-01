@@ -25,8 +25,8 @@ Const MESH_AROUND     = 24     ' minimum divisions round the circumference (rais
 Const N_DOME          = 4      ' divisions along each dome
 Const N_CONE          = 3      ' divisions along the conical wall
 Const N_WALL          = 5      ' divisions along the wetted cylindrical wall
-' The sheet takes capacity = V1 + V2 - V3, i.e. the bottom dome RISES into the tank.
-' Set to False for the classical Intze tank whose bottom dome hangs down (capacity + V3).
+' The sheet takes capacity = V1 + V2 - V3: the bottom dome rises into the tank, as in the
+' usual Intze tank. Set to False only for a bottom dome that hangs below the girder.
 Const BOTTOM_DOME_UP  = True
 
 Const PI   = 3.14159265358979
