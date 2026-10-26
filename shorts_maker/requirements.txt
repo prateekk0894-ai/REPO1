@@ -1,4 +1,0 @@
-faster-whisper>=1.0
-opencv-python>=4.8,<5
-numpy
-imageio-ffmpeg>=0.5
