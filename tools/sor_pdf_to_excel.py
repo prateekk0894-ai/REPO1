@@ -240,6 +240,23 @@ def table_block(tbl):
 
 
 ROAD_COLS = ("item", "name", "desc", "unit", "rate")
+ROAD_STATE = {}
+SUB_MARK = re.compile(r"^(\(?[ivxIVX]{1,5}\)|\(?[a-hA-H]\)|\([A-H]\)|[a-h]\.)$")
+
+
+def starts_sub_item(words, bounds):
+    """Line begins with a sub-item marker: (i), ii), a), (A), b. or a bare 'A' set apart."""
+    if not words or words[0]["x0"] > bounds["item"] + 45:
+        return False
+    t = words[0]["text"]
+    if SUB_MARK.match(t):
+        return True
+    m = re.match(r"^(\(?[ivx]{1,5}\)|\(?[a-h]\))\S", t)  # "(i)for" glued
+    if m:
+        return True
+    if re.fullmatch(r"[1-9]", t) and len(words) > 1 and words[1]["text"][:1].isupper():
+        return True
+    return bool(re.fullmatch(r"[A-H]", t)) and len(words) > 1 and words[1]["x0"] - words[0]["x1"] > 5
 
 
 def road_header(lines):
@@ -258,6 +275,28 @@ def road_header(lines):
 
 def road_block(hdr, body, bounds, left, right):
     """Un-ruled road SOR item table -> table block with one record per item."""
+    # Unit/rate words are often printed a few points above/below their text
+    # line: attach each of them to the nearest text line.
+    words = [w for ln in body for w in ln["words"]]
+    ur = [w for w in words if (w["x0"] + w["x1"]) / 2 >= bounds["unit"]]
+    txt_lines = group_lines([w for w in words if (w["x0"] + w["x1"]) / 2 < bounds["unit"]])
+    extra = []
+    for ul in group_lines(ur):
+        same = [l for l in txt_lines if abs(l["top"] - ul["top"]) <= 2.5]
+        below = [l for l in txt_lines if 0 < l["top"] - ul["top"] <= 12]
+        if same:
+            best = same[0]
+        elif below:
+            best = min(below, key=lambda l: l["top"])
+        else:
+            best = min(txt_lines, key=lambda l: abs(l["top"] - ul["top"]), default=None)
+        if best is not None and abs(best["top"] - ul["top"]) <= 12 and not any(
+            (w["x0"] + w["x1"]) / 2 >= bounds["unit"] for w in best["words"]
+        ):
+            best["words"] = best["words"] + ul["words"]
+        else:
+            extra.append(ul)
+    body = sorted(txt_lines + extra, key=lambda l: l["top"])
     starts = Counter()
     for ln in body:
         for ch in split_gaps(ln["words"], 14):
@@ -296,18 +335,41 @@ def road_block(hdr, body, bounds, left, right):
             else:
                 cells["desc"] = desc_words
         line = {k: " ".join(w["text"] for w in v) for k, v in cells.items()}
-        marker = LIST_START.match(line["name"] or line["desc"] or "") is not None and not col2
+        zone = cells["name"] or cells["desc"]
         cur = recs[-1] if recs else None
+        marked = starts_sub_item(zone, bounds)
+        bold = bool(zone) and sum("Bold" in w.get("fontname", "") for w in zone) > len(zone) / 2
         new = (
             cur is None
             or bool(line["item"])
+            or marked
+            or (bold and (cur["_bold"] is False or bool(cur["rate"])))
+            or (not bold and bool(zone) and cur["_bold"] is True)
+            or (bool(line["rate"]) and bool(cur["rate"]))
             or (col2 and bool(line["name"]) and bool(cur["name"]) and (bool(line["desc"]) or bool(line["rate"])) and
                 bool(cur["rate"] or cur["unit"]))
-            or (bool(line["rate"]) and bool(cur["rate"]))
-            or (marker and bool(cur["rate"] or cur["desc"]) and not cur["desc"][-1:] == [""])
         )
+        if (new and marked and not line["item"] and cur is not None and not cur["_marked"] and not cur["item"]
+                and recs[:-1] and ln["top"] - cur["_top"] < 14 and not (line["rate"] and cur["rate"])):
+            # marker printed half a line below the text it belongs to
+            new = False
+            mk = zone[0]["text"]
+            first_k = "name" if cur["name"] else "desc"
+            if cur[first_k]:
+                cur[first_k][0] = f"{mk} {cur[first_k][0]}"
+            rest = " ".join(w["text"] for w in zone[1:])
+            if cells["name"]:
+                line["name"] = rest
+            else:
+                line["desc"] = rest
+            cur["_marked"] = True
+        if not new and cur is not None and cur["_bold"] is None and zone:
+            cur["_bold"] = bold
         if new:
             cur = {k: [] for k in ROAD_COLS}
+            cur["_marked"] = marked or bool(line["item"])
+            cur["_bold"] = bold if zone else None
+            cur["_top"] = ln["top"]
             recs.append(cur)
         for k in ROAD_COLS:
             if line[k]:
@@ -316,7 +378,7 @@ def road_block(hdr, body, bounds, left, right):
     cells = [(0, 0, xs["item"], xs["name"], "Item No."), (0, 0, xs["name"], xs["unit"], "Description"),
              (0, 0, xs["unit"], xs["rate"], "Unit"), (0, 0, xs["rate"], xs["end"], "Rate")]
     for i, rec in enumerate(recs, start=1):
-        txt = {k: join_lines(v) if v else None for k, v in rec.items()}
+        txt = {k: (join_lines(rec[k]) if rec[k] else None) for k in ROAD_COLS}
         cells.append((i, i, xs["item"], xs["name"], txt["item"]))
         if col2 and txt["name"]:
             cells.append((i, i, xs["name"], xs["desc"], txt["name"]))
@@ -384,6 +446,17 @@ def parse_page(pg, kind):
     if kind == "road":
         hdr, bounds = road_header(lines)
         if bounds:
+            ROAD_STATE["bounds"] = bounds
+        elif ROAD_STATE.get("bounds") and ROAD_STATE.get("last") == pg.page_number - 1 and lines and any(
+            looks_like_rate(w["text"]) or NUM_RE.match(w["text"])
+            for ln in lines for w in ln["words"] if w["x0"] >= ROAD_STATE["bounds"]["rate"] - 10
+        ):
+            # continuation page printed without the table header
+            bounds = ROAD_STATE["bounds"]
+            first = min(lines, key=lambda l: l["top"])
+            hdr = {"top": first["top"] - 3, "x1": right}
+        if bounds:
+            ROAD_STATE["last"] = pg.page_number
             body = [ln for ln in lines if ln["top"] > hdr["top"] + 2]
             # stray second header line ("No.")
             body = [ln for ln in body if not (ln["top"] - hdr["top"] < 14 and ln["text"].strip() in ("No.", "(Rs.)"))]
@@ -463,14 +536,60 @@ class Grid:
 
 
 # ---------------------------------------------------------------- writer
-def lines_needed(text, width_pt, size):
+_FONTS = {}
+_FONT_FILES = {
+    ("serif", False): "/usr/share/fonts/truetype/liberation/LiberationSerif-Regular.ttf",
+    ("serif", True): "/usr/share/fonts/truetype/liberation/LiberationSerif-Bold.ttf",
+    ("sans", False): "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+    ("sans", True): "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+}
+
+
+def _font(size, bold):
+    fam = "serif" if "Times" in FONT_NAME else "sans"
+    key = (fam, bold, size)
+    if key not in _FONTS:
+        try:
+            from PIL import ImageFont
+            _FONTS[key] = ImageFont.truetype(_FONT_FILES[(fam, bold)], max(1, round(size * 96 / 72 * 4)))
+        except Exception:
+            _FONTS[key] = None
+    return _FONTS[key]
+
+
+def lines_needed(text, width_pt, size, bold=False):
+    """Number of wrapped lines Excel shows for text in a cell width_pt wide.
+
+    Measures the words with a metric-compatible font (Liberation = Times New
+    Roman / Arial metrics) and wraps them greedily, like Excel does."""
     if not text:
         return 1
-    cpl = max((width_pt - 4) / (size * 0.47), 1)
+    avail = (width_pt / 0.75 - 7) * 4  # px at 4x scale, minus cell padding
+    f = _font(size, bold)
+    if f is None:
+        cpl = max((width_pt - 4) / (size * 0.45), 1)
+        return sum(max(1, math.ceil(len(p) / cpl)) for p in str(text).split("\n"))
+    space = f.getlength(" ")
     n = 0
     for part in str(text).split("\n"):
-        n += max(1, math.ceil(len(part) / cpl))
+        n += 1
+        cur = 0.0
+        for word in part.split():
+            wl = f.getlength(word)
+            if cur and cur + space + wl > avail:
+                n += 1
+                cur = 0.0
+            if wl > avail:  # very long word breaks across lines
+                extra = int(wl // avail)
+                n += extra
+                cur = wl - extra * avail
+            else:
+                cur = cur + space + wl if cur else wl
     return n
+
+
+def row_h(lines, size):
+    return lines * size * 1.18 + 3
 
 
 class SheetWriter:
@@ -507,7 +626,7 @@ class SheetWriter:
         c.font = font(size, b["bold"])
         c.alignment = al
         self._merge(self.r, self.r, c0, c1)
-        self._height(self.r, lines_needed(b["text"], g.width_pt(c0, c1), size) * size * 1.3 + 2)
+        self._height(self.r, row_h(lines_needed(b["text"], g.width_pt(c0, c1), size, b["bold"]), size))
         self.r += 1
 
     def chunks(self, chunks, small=False, color=None):
@@ -535,7 +654,7 @@ class SheetWriter:
             cell.alignment = Alignment(wrap_text=True, vertical="top",
                                        horizontal="right" if (small and i == len(chunks) - 1 and i) else "left")
             self._merge(self.r, self.r, c0, c1)
-            h = max(h, lines_needed(ch[1], g.width_pt(c0, c1), 10) * 13 + 2)
+            h = max(h, row_h(lines_needed(ch[1], g.width_pt(c0, c1), 10, bold), 10))
         self._height(self.r, h)
         self.r += 1
 
@@ -579,7 +698,7 @@ class SheetWriter:
                     for cc in range(c0, c1 + 1):
                         self.ws.cell(rr, cc).fill = FILL_H
             self._merge(R0, R1, c0, c1)
-            h = lines_needed(txt, g.width_pt(c0, c1), 10) * 13 + 3
+            h = row_h(lines_needed(txt, g.width_pt(c0, c1), 10, is_hdr), 10)
             if R1 == R0:
                 self._height(R0, h)
             else:
