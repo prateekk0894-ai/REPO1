@@ -45,7 +45,17 @@ def main(path, map_path=None):
                 total += 1
                 r, c = cell.row, cell.column
                 owner = None
+                # prefer a text cell on exactly this row (cells merged over several rows are shared
+                # headings such as "Quantity of sample" and do not identify the item)
                 for cc in range(c - 1, 0, -1):
+                    a = anchor.get((r, cc), (r, cc))
+                    rng_rows = [rg for rg in ws.merged_cells.ranges if (rg.min_row, rg.min_col) == a]
+                    single = not rng_rows or rng_rows[0].min_row == rng_rows[0].max_row
+                    v = ws.cell(*a).value
+                    if single and isinstance(v, str) and len(v.strip()) >= 4 and any(ch.isalpha() for ch in v):
+                        owner = a
+                        break
+                for cc in (range(c - 1, 0, -1) if owner is None else []):
                     a = anchor.get((r, cc), (r, cc))
                     v = ws.cell(*a).value
                     if isinstance(v, str) and len(v.strip()) >= 4 and any(ch.isalpha() for ch in v):

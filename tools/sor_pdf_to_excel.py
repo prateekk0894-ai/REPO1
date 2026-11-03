@@ -1139,6 +1139,17 @@ def parse_abs(pg, kind):
         if hl is not None:  # the road item list is un-ruled: read it as text lines
             tables = [t for t in tables if t.bbox[3] < hl["top"]]
 
+    if words:  # one text size per scanned page (OCR box heights vary a lot)
+        hs_ = sorted(w["size"] for w in words)
+        med = hs_[len(hs_) // 2]
+        for w in words:
+            w["size"] = med
+    # a partly detected grid (faint / warped rules) would put text in wrong cells: use it only
+    # when it holds most of the page's text
+    if tables and words:
+        inside_n = sum(1 for w in words if any(inside(w, t.bbox) for t in tables))
+        if inside_n < 0.7 * len(words):
+            tables = []
     tabs = []
     for t in tables:
         rows = t.rows
@@ -1203,11 +1214,25 @@ def parse_abs(pg, kind):
             bounds = ROAD_STATE["bounds"]
             ROAD_STATE["last"] = pg.page_number
 
+    if bounds:
+        # a second text column inside the description zone (Item Name | Description):
+        # word starts after a gap, repeated on many lines at the same x
+        from collections import Counter as _C
+        st = _C()
+        for ln in body:
+            ws_ = ln["words"]
+            for a_, b_ in zip(ws_, ws_[1:]):
+                if b_["x0"] - a_["x1"] >= 7 and bounds["item"] + 30 < b_["x0"] < bounds["item"] + 160:
+                    st[round(b_["x0"] / 3) * 3] += 1
+        best = [x for x, n in st.items() if n >= 4]
+        bounds = dict(bounds)
+        bounds["col2"] = min(best) if best else None
+
     def chunks_of(ln):
         ws = ln["words"]
         out = split_table_line(ws)
         if bounds:  # also cut at the road column boundaries
-            cuts = [bounds["item"], bounds["unit"], bounds["rate"]]
+            cuts = [bounds["item"], bounds["unit"], bounds["rate"]] + ([bounds["col2"] - 2] if bounds.get("col2") else [])
             res = []
             for ch in out:
                 cur = [ch[0]]
@@ -1311,7 +1336,8 @@ def parse_abs(pg, kind):
         "w": pg.width, "h": pg.height, "landscape": pg.width > pg.height,
         "lines": attach_rates(mk_lines(body), bounds), "footer_lines": mk_lines(footer), "tables": tabs,
         "imgs": imgs, "kind": kind,
-        "rules": merged, "vrules": vrules, "frames": frames, "road_bounds": bounds, "scan": scan, "footer": footer_blk,
+        "rules": merged, "vrules": vrules, "frames": frames, "road_bounds": bounds, "scan": scan,
+        "no_text": body_words == 0, "footer": footer_blk,
         "footer_text": " ".join(ln["text"] for ln in footer),
         "top_lines": [ln["text"] for ln in sorted(body, key=lambda l: l["top"])[:8]],
         "left": min(xs) if xs else 40, "right": max(xe) if xe else pg.width - 40,
@@ -1588,35 +1614,52 @@ class AbsWriter:
                 cur["rate"] = cur["rate"] or has_rate
                 cur["lines"].append(ln)
                 cur["desc"] += [(ln, c) for c in desc]
-            for rec in recs:
-                if not rec["desc"]:
-                    continue
+            # second text column inside the description zone (Item Name | Description), e.g. Ch-21
+            from collections import Counter as _C
+            starts = _C(round(c["x0"] / 3) * 3 for ln in lines for c in ln["chunks"]
+                        if is_desc(c) and bd["item"] + 30 < c["x0"] < bd["unit"] - 60)
+            col2 = bd.get("col2") or min([x for x, n in starts.items() if n >= 4 and x < bd["item"] + 160],
+                                         default=None)
+
+            def put(group, stop_x):
                 by_line = {}
-                for ln, c in rec["desc"]:
+                for ln, c in group:
                     by_line.setdefault(id(ln), (ln, []))[1].append(c)
-                parts = [" ".join(c["text"] for c in cs) for ln, cs in
-                         sorted(by_line.values(), key=lambda v: v[0]["top"])]
-                R0 = row(rec["desc"][0][0]["top"])
-                R1 = row(rec["desc"][-1][0]["top"])
-                c0 = g.col_at(min(c["x0"] for _, c in rec["desc"]))
-                others = [c["x0"] for ln in rec["lines"] for c in ln["chunks"]
-                          if not is_desc(c) and c["x0"] > min(cc["x1"] for _, cc in rec["desc"]) - 1]
-                stop = min([bd["unit"]] + others)
-                c1 = max(c0, g.col_at(stop) - 1 if g.x_of(g.col_at(stop)) >= stop - 1.5 else g.col_at(stop) - 1)
+                ordered = sorted(by_line.values(), key=lambda v: v[0]["top"])
+                parts = [" ".join(c["text"] for c in cs) for _, cs in ordered]
+                R0, R1 = row(ordered[0][0]["top"]), row(ordered[-1][0]["top"])
+                c0 = g.col_at(min(c["x0"] for _, c in group))
+                c1 = max(c0, g.col_at(stop_x) - 1)
                 span = [(rr, cc) for rr in range(R0, R1 + 1) for cc in range(c0, c1 + 1)]
                 if any(sp in occupied for sp in span):
-                    continue
+                    return False
                 for sp in span:
                     occupied[sp] = (R0, c0)
                 if R1 > R0 or c1 > c0:
                     ws.merge_cells(start_row=R0, start_column=c0, end_row=R1, end_column=c1)
-                c = rec["desc"][0][1]
+                c = group[0][1]
                 cell = ws.cell(R0, c0, keep_lines(parts))
                 cell.font = font_of(c["font"], c["size"], c["color"])
                 cell.alignment = Alignment(horizontal="left", vertical="top", wrap_text=True)
                 self.extra.append((R0, R1, len(parts) * c["size"] * 1.17 + 2, cell))
-                for _, c in rec["desc"]:
+                for _, c in group:
                     done.add(id(c))
+                return True
+
+            for rec in recs:
+                if not rec["desc"]:
+                    continue
+                others = [c["x0"] for ln in rec["lines"] for c in ln["chunks"]
+                          if not is_desc(c) and c["x0"] > min(cc["x1"] for _, cc in rec["desc"]) - 1]
+                stop = min([bd["unit"]] + others)
+                if col2 is not None:
+                    name = [(ln, c) for ln, c in rec["desc"] if c["x0"] < col2 - 4]
+                    desc = [(ln, c) for ln, c in rec["desc"] if c["x0"] >= col2 - 4]
+                    if name and desc and max(c["x1"] for _, c in name) < col2 + 2:
+                        put(name, col2)
+                        put(desc, stop)
+                        continue
+                put(rec["desc"], stop)
 
         # ---- free text lines (one PDF line = one Excel row)
         for ln in lines:
@@ -1924,6 +1967,182 @@ def cell_align(lns, x0, x1, numeric):
     return "left"
 
 
+# ---------------------------------------------------------------- OCR of scanned pages
+_OCR = {}
+
+
+def _ocr_engine():
+    if "e" not in _OCR:
+        try:
+            from rapidocr_onnxruntime import RapidOCR
+            _OCR["e"] = RapidOCR()
+        except Exception:
+            print("OCR engine not available (pip install rapidocr_onnxruntime): scanned pages stay pictures")
+            _OCR["e"] = None
+    return _OCR["e"]
+
+
+def _dark_segments(dark, minlen):
+    """Long dark runs along axis 1, merged over neighbouring rows -> (start, end, centre)."""
+    import numpy as np
+    out, active = [], []
+    for y in range(dark.shape[0]):
+        d = np.diff(np.concatenate(([0], dark[y].astype(np.int8), [0])))
+        st, en = np.where(d == 1)[0], np.where(d == -1)[0]
+        new = []
+        for a, b in zip(st, en):
+            if b - a < minlen:
+                continue
+            hit = next((sg for sg in active if sg["y1"] >= y - 1 and min(b, sg["b"]) - max(a, sg["a"]) > 0.5 * (b - a)),
+                       None)
+            if hit:
+                hit["y1"], hit["a"], hit["b"] = y, min(hit["a"], a), max(hit["b"], b)
+                new.append(hit)
+            else:
+                sg = {"a": a, "b": b, "y0": y, "y1": y}
+                out.append(sg)
+                new.append(sg)
+        active = new
+    return [(sg["a"], sg["b"], (sg["y0"] + sg["y1"]) / 2) for sg in out if sg["y1"] - sg["y0"] <= 14]
+
+
+def _chain(segs, gap=45.0, drift=6.0, minlen=50.0):
+    """Join collinear pieces of a wavy hand-scanned rule into one straight line."""
+    segs = sorted(segs, key=lambda t: t[0])
+    chains = []
+    for a, b, y in segs:
+        best = None
+        for ch in chains:
+            if 0 <= a - ch["b"] <= gap or (a < ch["b"] and b > ch["b"]):
+                if abs(ch["ye"] - y) <= drift and (best is None or abs(ch["ye"] - y) < abs(best["ye"] - y)):
+                    best = ch
+        if best is not None:
+            best["b"] = max(best["b"], b)
+            best["ye"] = y
+            best["ys"].append(y)
+        else:
+            chains.append({"a": a, "b": b, "ye": y, "ys": [y]})
+    out = []
+    for ch in chains:
+        if ch["b"] - ch["a"] >= minlen:
+            ys = sorted(ch["ys"])
+            out.append((ch["a"], ch["b"], ys[len(ys) // 2]))
+    return out
+
+
+def ocr_page(src, page_no, pg, kind, dpi=200):
+    """Scanned page -> page dict like parse_abs(): table grid from the ruled lines in the
+    picture, text from OCR."""
+    import subprocess
+    import tempfile
+    import numpy as np
+    from PIL import Image
+    eng = _ocr_engine()
+    if eng is None:
+        return None
+    tmp = tempfile.mkdtemp(prefix="sorocr_")
+    png = os.path.join(tmp, "p.png")
+    subprocess.run(["pdftoppm", "-f", str(page_no), "-l", str(page_no), "-r", str(dpi), "-png", "-singlefile",
+                    src, os.path.join(tmp, "p")], check=True)
+    k = 72 / dpi
+    W, H = pg.width, pg.height
+    # straighten photographed / tilted scans (best angle = sharpest row profile)
+    img = Image.open(png).convert("L")
+    small = img.resize((img.width // 4, img.height // 4))
+
+    def _score(a):
+        r = np.asarray(small.rotate(a, resample=Image.BILINEAR, fillcolor=255)) < 150
+        return float((r.sum(1).astype(float) ** 2).sum())
+
+    ang = max(np.arange(-3, 3.01, 0.25), key=_score)
+    if abs(ang) >= 0.25:
+        ang = max(np.arange(ang - 0.25, ang + 0.26, 0.05), key=_score)
+        img = img.rotate(ang, resample=Image.BILINEAR, fillcolor=255)
+        img.save(png)
+    im = np.asarray(img)
+    dark = im < 150
+    minlen = int(25 / k)
+    hs = [(a * k, b * k, y * k) for a, b, y in _dark_segments(dark, minlen)]
+    vs = [(a * k, b * k, x * k) for a, b, x in _dark_segments(dark.T, minlen)]
+    hs, vs = _chain(hs), _chain(vs)
+    hs = [h for h in hs if h[2] < H * 0.9]
+    vs = [v for v in vs if v[1] < H * 0.92]
+    Hl = [{"x0": a, "x1": b, "top": y, "bottom": y, "width": b - a, "height": 0, "object_type": "line"}
+          for a, b, y in hs]
+    Vl = [{"x0": x, "x1": x, "top": a, "bottom": b, "width": 0, "height": b - a, "object_type": "line"}
+          for a, b, x in vs]
+    tables = []
+    if Hl and Vl:
+        try:
+            tables = pg.find_tables({"vertical_strategy": "explicit", "horizontal_strategy": "explicit",
+                                     "explicit_vertical_lines": Vl, "explicit_horizontal_lines": Hl,
+                                     "snap_tolerance": 5, "join_tolerance": 8, "intersection_tolerance": 6})
+        except Exception:
+            tables = []
+    res, _ = eng(png)
+    words = []
+    for box, txt, conf in res or []:
+        xs = [pt[0] * k for pt in box]
+        ys = [pt[1] * k for pt in box]
+        top, bot = min(ys), max(ys)
+        if top > H * 0.9 or not txt.strip():
+            continue  # page footer is real text, already in the chapter sheet
+        txt = txt.strip()
+        m = re.fullmatch(r"[-–—~_.,:;'`\s]*(\d[\d,]*\.\d{2})[-–—~_.,:;'`\s]*", txt)
+        if m:  # stray dash / dot read next to a number
+            txt = m.group(1)
+        words.append({"text": fix_text(txt), "x0": min(xs), "x1": max(xs), "top": top, "bottom": bot,
+                      "fontname": "Times", "size": max(6.0, min(14.0, (bot - top) * 0.72)), "color": None})
+    if words:  # one text size per scanned page (OCR box heights vary a lot)
+        hs_ = sorted(w["size"] for w in words)
+        med = hs_[len(hs_) // 2]
+        for w in words:
+            w["size"] = med
+    # a partly detected grid (faint / warped rules) would put text in wrong cells: use it only
+    # when it holds most of the page's text
+    if tables and words:
+        inside_n = sum(1 for w in words if any(inside(w, t.bbox) for t in tables))
+        if inside_n < 0.7 * len(words):
+            tables = []
+    tabs = []
+    for t in tables:
+        rows = t.rows
+        tops = [r.bbox[1] for r in rows] + [rows[-1].bbox[3]]
+        cells = []
+        for ri, row in enumerate(rows):
+            for bb in row.cells:
+                if bb is None:
+                    continue
+                r1 = ri
+                while r1 + 1 < len(rows) and tops[r1 + 1] < bb[3] - 2:
+                    r1 += 1
+                inner = [w for w in words if inside(w, bb) and not w.get("_used")]
+                for w in inner:
+                    w["_used"] = True
+                cells.append({"bb": bb, "r0": ri, "r1": r1, "words": inner})
+        rate_x = []
+        for c in cells:
+            if c["r0"] <= 3 and c["words"]:
+                txt = " ".join(w["text"] for w in c["words"])
+                if re.search(r"\b(Rate|Rates|Rs\.?|Amount)", txt, re.I) and len(txt) < 60:
+                    rate_x.append((c["bb"][0] - 1, c["bb"][2] + 1))
+        tabs.append({"bbox": t.bbox, "tops": tops, "cells": cells, "rate_x": rate_x})
+    free = [w for w in words if not w.get("_used")]
+    lines = []
+    for ln in group_lines(free, tol=4):
+        chs = []
+        for ch in split_table_line(ln["words"]):
+            chs.append({"x0": ch[0]["x0"], "x1": max(w["x1"] for w in ch),
+                        "text": " ".join(w["text"] for w in ch), "font": "Times", "size": ch[0]["size"],
+                        "color": None})
+        lines.append({"top": ln["top"], "bottom": ln["bottom"], "chunks": chs})
+    xs = [w["x0"] for w in words] + [t["bbox"][0] for t in tabs] or [40]
+    xe = [w["x1"] for w in words] + [t["bbox"][2] for t in tabs] or [W - 40]
+    return {"w": W, "h": H, "landscape": W > H, "lines": lines, "footer_lines": [], "tables": tabs, "imgs": [],
+            "img_paths": [], "rules": [], "vrules": [], "frames": [], "road_bounds": None, "scan": False,
+            "footer": None, "footer_text": "", "top_lines": [], "left": min(xs), "right": max(xe), "kind": kind}
+
+
 def convert(src, dst, kind):
     import subprocess
     import tempfile
@@ -1932,6 +2151,7 @@ def convert(src, dst, kind):
         rng = os.environ.get("PAGES")
         sel = range(*map(int, rng.split("-"))) if rng else range(len(pdf.pages))
         sheets, order = {}, []
+        ocr_pages = []
         for i in sel:
             pg = pdf.pages[i]
             pg = pg.within_bbox((0, 0, pg.width, pg.height)).dedupe_chars()
@@ -1943,6 +2163,12 @@ def convert(src, dst, kind):
                 subprocess.run(["pdftoppm", "-f", str(i + 1), "-l", str(i + 1), "-r", "150", "-png",
                                 "-singlefile", src, os.path.join(tmp, "p")], check=True)
                 p["image"] = os.path.join(tmp, "p.png")
+                if p.get("no_text") and os.environ.get("NO_OCR") is None:
+                    q = ocr_page(src, i + 1, pg, kind)
+                    if q is not None:
+                        q["no"] = i + 1
+                        q["chap"] = chap
+                        ocr_pages.append(q)
             else:
                 p["img_paths"] = [crop(src, i + 1, b) for b in p["imgs"]]
             normalise(p)
@@ -1984,6 +2210,27 @@ def convert(src, dst, kind):
             page_map.append({"sheet": ws.title, "page": p["no"], "r0": r0, "r1": r1})
         w.finish(land)
         set_header_footer(ws, chap, pages, tpl)
+    # scanned pages: editable copy made by OCR (the picture stays in the chapter sheet)
+    if ocr_pages:
+        for land in (False, True):
+            pages = [q for q in ocr_pages if q["landscape"] == land]
+            if not pages:
+                continue
+            nm = "Scanned pages - OCR text" + (" (Landscape)" if land else "")
+            ws = wb.create_sheet(sheet_title(nm, used))
+            w = AbsWriter(ws, nm, pages, use_footer_rows=False)
+            ws.cell(1, 1)  # keep A1
+            for q in pages:
+                w.page(q)
+            w.finish(land)
+            _hf(ws.oddHeader.left, "Editable text read by OCR from scanned PDF pages - check against the picture")
+            _hf(ws.oddHeader.right, "PDF page &P")
+            _hf(ws.oddFooter.right, "PDF page &P")
+            nos = [q["no"] for q in pages]
+            if nos == list(range(nos[0], nos[0] + len(nos))):
+                ws.page_setup.firstPageNumber = nos[0]
+                ws.page_setup.useFirstPageNumber = True
+            print(f"OCR sheet {ws.title}: {len(pages)} pages", flush=True)
     wb.save(dst)
     if os.environ.get("MAPFILE"):
         import json
