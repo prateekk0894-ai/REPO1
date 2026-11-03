@@ -15,6 +15,7 @@ that look like the PDF pages.
 Usage:  python3 tools/sor_pdf_to_excel.py input.pdf output.xlsx [road|em|grid]
 """
 import math
+from copy import copy
 import os
 import re
 import sys
@@ -34,6 +35,7 @@ BAD_SHEET_CHARS = re.compile(r"[\[\]\:\*\?\/\\]")
 LIST_START = re.compile(r"^(\(?\d{1,2}(\.\d+)*[.)]|\(?[a-zA-Z]{1,4}\)|\(?[ivx]+\)|•|➢|\*|Note|NOTE|N\.B)")
 
 FONT_NAME = "Times New Roman"
+NO_HEADER_RATES = False  # tables without a Rate header: keep numbers as printed text
 RUPEE_FMT = '"₹ "0.00'
 THIN = Side(style="thin", color="000000")
 BORDER = Border(left=THIN, right=THIN, top=THIN, bottom=THIN)
@@ -52,6 +54,15 @@ def fix_text(s):
     if s is None:
         return None
     return s.replace(SLOGAN_KD, SLOGAN_UNI).replace("", "•").replace("", "➢")
+
+
+KEEP_LINES = True
+
+
+def keep_lines(parts):
+    """PDF lines kept as separate lines inside one cell (same line breaks as the PDF)."""
+    out = [p.strip() for p in parts if p and p.strip()]
+    return fix_text("\n".join(out)) if out else None
 
 
 def join_lines(parts):
@@ -235,7 +246,7 @@ def cell_text(words, bb):
         return None
     for w in inner:
         w["_used"] = True
-    return join_lines([ln["text"] for ln in group_lines(inner)])
+    return keep_lines([ln["text"] for ln in group_lines(inner)])
 
 
 def table_block(tbl, words):
@@ -284,7 +295,8 @@ def table_block(tbl, words):
         if c[0] < max(hdr, 1) and c[4] and re.search(r"\bRate\b", c[4], re.I):
             numx = c[2] - 2
             break
-    return {"t": "table", "cells": cells, "nrows": len(rows), "hdr": hdr, "numx": numx, "top": tbl.bbox[1]}
+    return {"t": "table", "cells": cells, "nrows": len(rows), "hdr": hdr, "numx": numx, "top": tbl.bbox[1],
+            "bbox": tbl.bbox, "row_tops": tops}
 
 
 ROAD_COLS = ("item", "name", "desc", "unit", "rate")
@@ -458,7 +470,7 @@ def road_block(hdr, body, bounds, left, right):
     cells = [(0, 0, xs["item"], xs["name"], "Item No."), (0, 0, xs["name"], xs["unit"], "Description"),
              (0, 0, xs["unit"], xs["rate"], "Unit"), (0, 0, xs["rate"], xs["end"], "Rate")]
     for i, rec in enumerate(recs, start=1):
-        txt = {k: (join_lines(rec[k]) if rec[k] else None) for k in ROAD_COLS}
+        txt = {k: (keep_lines(rec[k]) if rec[k] else None) for k in ROAD_COLS}
         cells.append((i, i, xs["item"], xs["name"], txt["item"]))
         if col2 and txt["name"]:
             cells.append((i, i, xs["name"], xs["desc"], txt["name"]))
@@ -488,7 +500,8 @@ def text_blocks(lines, page_w, right_margin):
                "text": fix_text(ln["text"]), "size": ln["size"], "bold": ln["bold"], "center": centered}
         prev = out[-1] if out else None
         if (
-            prev is not None
+            KEEP_LINES is False
+            and prev is not None
             and prev["t"] == "text"
             and not prev["center"]
             and not centered
@@ -566,6 +579,23 @@ def parse_page(pg, kind):
             lines = above
     rmargin = max((ln["x1"] for ln in lines), default=right)
     blocks += text_blocks(lines, pg.width, rmargin)
+    # pictures (logos, photos, diagrams): cropped from the page later and placed at the same spot
+    page_area = pg.width * pg.height
+    for im in pg.images:
+        x0, t, x1, bt = max(im["x0"], 0), max(im["top"], 0), min(im["x1"], pg.width), min(im["bottom"], pg.height)
+        if x1 - x0 < 15 or bt - t < 15:
+            continue
+        if (x1 - x0) * (bt - t) > 0.5 * page_area and len(words) > 60:
+            continue  # background / watermark behind text
+        if t > pg.height * 0.9:
+            continue  # footer decoration
+        bb = (x0, t, x1, bt)
+        tb = next((b for b in blocks if b["t"] == "table" and b.get("bbox")
+                   and b["bbox"][1] - 2 <= (t + bt) / 2 <= b["bbox"][3] + 2), None)
+        if tb is not None:
+            tb.setdefault("imgs", []).append(bb)
+        else:
+            blocks.append({"t": "img", "top": t, "bbox": bb})
     blocks.sort(key=lambda b: b["top"])
     top_lines = [ln["text"] for ln in sorted(lines, key=lambda l: l["top"])[:8]]
     footer_blk = None
@@ -582,7 +612,8 @@ def parse_page(pg, kind):
     # scanned page (no text layer) or a picture cover page with only a few words
     scan = (body_words == 0 and img_area > 0.1 * page_area) or (body_words < 40 and img_area > 0.7 * page_area)
     return {"blocks": blocks, "footer": footer_blk, "footer_text": footer_text, "top_lines": top_lines,
-            "left": left, "right": right, "width": pg.width, "scan": scan}
+            "left": left, "right": right, "width": pg.width, "height": pg.height, "scan": scan,
+            "landscape": pg.width > pg.height}
 
 
 # ---------------------------------------------------------------- grid
@@ -692,7 +723,7 @@ def lines_needed(text, width_pt, size, bold=False):
     Roman / Arial metrics) and wraps them greedily, like Excel does."""
     if not text:
         return 1
-    avail = (width_pt / 0.75 - 7) * 4  # px at 4x scale, minus cell padding
+    avail = (width_pt / 0.75 - 9) * 4 / 1.06  # px at 4x scale, minus padding, +6% for Excel
     f = _font(size, bold)
     if f is None:
         cpl = max((width_pt - 4) / (size * 0.45), 1)
@@ -720,7 +751,7 @@ MIN_ROW = 13.5
 
 
 def row_h(lines, size):
-    return lines * size * 1.17 + 2
+    return lines * size * 1.26 + 3
 
 
 class SheetWriter:
@@ -731,6 +762,8 @@ class SheetWriter:
         self.r = 1
         self.need = {}  # row -> required height (pt)
         self.page_rows = []  # (first row, last row) of each PDF page
+        self.landscape = False
+        self.footer_rows = True
         self.page_r0 = 1
         self.vneed = []  # (r0, r1, height) for vertically merged cells
         g = self.grid
@@ -846,7 +879,42 @@ class SheetWriter:
                 self._height(R0, h)
             else:
                 self.vneed.append((R0, R1, h))
+        for (x0, t, x1, bt), path in zip(b.get("imgs", []), b.get("paths") or []):
+            tops = b["row_tops"]
+            ri = max([i for i, tp in enumerate(tops[:-1]) if tp <= t + 2] or [0])
+            col = g.col_at(x0)
+            self._place(path, base + ri, col, x0 - g.edges[col - 1], x1 - x0, bt - t)
+            # rows below the picture's top must be at least as tall as the picture
+            r_end = ri
+            while r_end + 1 < len(tops) - 1 and tops[r_end + 1] < bt - 2:
+                r_end += 1
+            self.vneed.append((base + ri, base + r_end, (bt - t) + (t - tops[ri]) + 2))
         self.r = base + b["nrows"]
+
+    def _place(self, path, row, col, x_off_pt, w_pt, h_pt):
+        from openpyxl.drawing.image import Image as XLImage
+        from openpyxl.drawing.spreadsheet_drawing import AnchorMarker, OneCellAnchor
+        from openpyxl.drawing.xdr import XDRPositiveSize2D
+        img = XLImage(path)
+        emu = 12700
+        img.anchor = OneCellAnchor(_from=AnchorMarker(col=col - 1, colOff=int(max(x_off_pt, 0) * emu),
+                                                      row=row - 1, rowOff=0),
+                                   ext=XDRPositiveSize2D(int(w_pt * emu), int(h_pt * emu)))
+        img.width, img.height = int(w_pt / 0.75), int(h_pt / 0.75)
+        self.ws.add_image(img)
+
+    def picture(self, b):
+        """Free-standing picture: own rows, same width/height and left position as in the PDF."""
+        x0, t, x1, bt = b["bbox"]
+        g = self.grid
+        col = g.col_at(x0)
+        self._place(b["path"], self.r, col, x0 - g.edges[col - 1], x1 - x0, bt - t)
+        h = bt - t
+        while h > 0:
+            step = min(h, 30)
+            self._height(self.r, max(step, MIN_ROW))
+            h -= step
+            self.r += 1
 
     def image(self, path):
         """Place a picture of a scanned PDF page, sized to the sheet width."""
@@ -866,7 +934,7 @@ class SheetWriter:
             self.r += 1
 
     def page_end(self, footer):
-        if footer:
+        if footer and self.footer_rows:
             txt = "     ".join(t for _, t in footer["chunks"])
             c = self.ws.cell(self.r, 1, txt)
             c.font = font(8, False, "595959")
@@ -888,7 +956,6 @@ class SheetWriter:
             ws.row_dimensions[r].height = min(round(h, 1), 409)
         ws.sheet_view.showGridLines = False
         ws.print_title_rows = None
-        ws.page_setup.orientation = "portrait"
         ws.page_setup.paperSize = ws.PAPERSIZE_A4
         ws.sheet_format.defaultRowHeight = MIN_ROW
         ws.sheet_format.customHeight = True
@@ -898,8 +965,10 @@ class SheetWriter:
         g = self.grid
         width_pt = sum(((ws.column_dimensions[get_column_letter(c)].width or 8.43) * 7) * 0.75
                        for c in range(1, g.ncols + 1))
-        scale = min(1.0, (595 - 0.8 * 72) / width_pt)
-        avail = 842 - 72 - 18
+        pw, ph = (842, 595) if self.landscape else (595, 842)
+        ws.page_setup.orientation = "landscape" if self.landscape else "portrait"
+        scale = min(1.0, (pw - 0.8 * 72) / width_pt)
+        avail = ph - 72 - 18
         for r0, r1 in self.page_rows:
             h = sum(min(self.need.get(r, MIN_ROW), 409) for r in range(r0, r1 + 1))
             if h * scale > avail:
@@ -908,37 +977,975 @@ class SheetWriter:
         ws.page_setup.scale = max(10, int(scale * 100 * 0.95))  # 5% slack for font metric differences
         ws.print_area = f"A1:{get_column_letter(g.ncols)}{max(ws.max_row, 1)}"
         ws.print_options.horizontalCentered = True
-        ws.oddFooter.center.text = title
+
+
+
+def crop(src, page_no, bbox, dpi=200):
+    """Crop a region of a PDF page to a PNG file (exact picture as printed)."""
+    import subprocess
+    import tempfile
+    x0, t, x1, bt = bbox
+    k = dpi / 72
+    out = os.path.join(tempfile.mkdtemp(prefix="sorimg_"), "c")
+    subprocess.run(["pdftoppm", "-f", str(page_no), "-l", str(page_no), "-r", str(dpi), "-png", "-singlefile",
+                    "-x", str(int(x0 * k)), "-y", str(int(t * k)), "-W", str(max(1, int((x1 - x0) * k))),
+                    "-H", str(max(1, int((bt - t) * k))), src, out], check=True)
+    return out + ".png"
+
+
+def _footer_parts(p):
+    if not p.get("footer"):
+        return None
+    texts = [t for _, t in p["footer"]["chunks"] if t and t.strip()]
+    if not texts:
+        return None
+    m = re.search(r"(\d+)\s*$", texts[-1])
+    if not m:
+        return None
+    last = texts[-1][: m.start()] + "&P" + texts[-1][m.end():]
+    return (tuple(texts[:-1]), last, int(m.group(1)))
+
+
+def footer_template(pages):
+    """If every page footer is the same text with a page number that rises by one per PDF page,
+    return (left texts, right text with &P, first printed number); else None."""
+    parts = [_footer_parts(p) for p in pages]
+    if not parts or any(x is None for x in parts):
+        return None
+    if len({(x[0], x[1]) for x in parts}) != 1:
+        return None
+    offs = {p["no"] - x[2] for p, x in zip(pages, parts)}
+    nos = [p["no"] for p in pages]
+    if len(offs) != 1 or nos != list(range(nos[0], nos[0] + len(nos))):
+        return None
+    return parts[0][0], parts[0][1], parts[0][2]
+
+
+def _hf(part, text, size=8):
+    part.text = text
+    part.size = size
+    part.font = f"{FONT_NAME},Regular"
+
+
+def set_header_footer(ws, title, pages, tpl):
+    """Page numbers in the Excel header and footer, matching the PDF."""
+    nos = [p["no"] for p in pages]
+    contiguous = nos == list(range(nos[0], nos[0] + len(nos)))
+    esc = lambda t: t.replace("&", "&&")
+    if tpl is not None:
+        left, right, first = tpl
+        _hf(ws.oddFooter.left, esc("     ".join(left)))
+        _hf(ws.oddFooter.right, esc(right).replace("&&P", "&P"))
+        ws.page_setup.firstPageNumber = first
+        ws.page_setup.useFirstPageNumber = True
+        _hf(ws.oddHeader.right, "Page &P")
+    else:
+        if contiguous:
+            ws.page_setup.firstPageNumber = nos[0]
+            ws.page_setup.useFirstPageNumber = True
+            _hf(ws.oddHeader.right, "PDF Page &P")
+            _hf(ws.oddFooter.right, "PDF Page &P")
+        else:
+            _hf(ws.oddHeader.right, "Page &P")
+            _hf(ws.oddFooter.right, "Page &P")
+    _hf(ws.oddHeader.left, esc(title))
+
+
+# ====================================================================== PDF-exact layout
+# Every PDF page is rebuilt on the sheet with the same geometry:
+#   * row boundaries = y-positions of text lines, table rows, pictures and ruled lines
+#   * column boundaries = x-positions of table lines, text starts, numbers, pictures
+#   * row heights / column widths are the PDF distances (points), so printing the sheet
+#     (or saving it as PDF) gives the same page.
+PAPERS = {9: (595.3, 841.9), 1: (612.0, 792.0)}  # A4, Letter
+
+
+def font_of(fontname, size, color=None):
+    fn = fontname or ""
+    low = fn.lower()
+    if "times" in low:
+        name = "Times New Roman"
+    elif "calibri" in low:
+        name = "Calibri"
+    elif "cambria" in low:
+        name = "Cambria"
+    elif "verdana" in low:
+        name = "Verdana"
+    elif "tahoma" in low:
+        name = "Tahoma"
+    elif "bookman" in low:
+        name = "Bookman Old Style"
+    elif "courier" in low:
+        name = "Courier New"
+    else:
+        name = "Arial"
+    name = "Times New Roman"  # one font everywhere (as asked); size / bold / italic follow the PDF
+    bold = "bold" in low or "black" in low or "heavy" in low
+    italic = "italic" in low or "oblique" in low
+    kw = {"name": name, "size": max(4.0, round(size * 2) / 2), "bold": bold, "italic": italic}
+    if color:
+        kw["color"] = color
+    return Font(**kw)
+
+
+def rgb_hex(c):
+    """pdfplumber colour -> 'RRGGBB' (None for black / unknown)."""
+    try:
+        if c is None:
+            return None
+        if isinstance(c, (int, float)):
+            c = (c, c, c)
+        c = tuple(c)
+        if len(c) == 1:
+            c = (c[0],) * 3
+        if len(c) == 4:  # CMYK
+            k = c[3]
+            c = tuple((1 - min(1, x + k)) for x in c[:3])
+        if len(c) != 3:
+            return None
+        r, g, b = (max(0, min(255, int(round(x * 255)))) for x in c)
+        if r < 40 and g < 40 and b < 40:
+            return None
+        return f"{r:02X}{g:02X}{b:02X}"
+    except Exception:
+        return None
+
+
+def word_info(words):
+    """Dominant font name / size / colour of a group of words."""
+    fn = Counter(w.get("fontname", "") for w in words).most_common(1)[0][0]
+    sz = Counter(round(w.get("size", 10), 1) for w in words).most_common(1)[0][0]
+    col = Counter(w.get("color") for w in words).most_common(1)[0][0]
+    return fn, sz, col
+
+
+def get_words(pg):
+    words = pg.extract_words(x_tolerance=1.5, y_tolerance=3, return_chars=True)
+    for w in words:
+        chs = w.pop("chars")
+        w["fontname"] = Counter(c["fontname"] for c in chs).most_common(1)[0][0]
+        w["size"] = Counter(round(c["size"], 1) for c in chs).most_common(1)[0][0]
+        w["color"] = rgb_hex(Counter(str(c.get("non_stroking_color")) for c in chs).most_common(1)[0][0]
+                             and chs[0].get("non_stroking_color"))
+    return words
+
+
+def parse_abs(pg, kind):
+    """Collect everything on a PDF page with its position."""
+    words = get_words(pg)
+    tables = [t for t in pg.find_tables() if (t.bbox[3] - t.bbox[1]) > 15 and t.rows]
+    if kind == "road":
+        hl, _ = road_header(group_lines(words))
+        if hl is not None:  # the road item list is un-ruled: read it as text lines
+            tables = [t for t in tables if t.bbox[3] < hl["top"]]
+
+    tabs = []
+    for t in tables:
+        rows = t.rows
+        tops = [r.bbox[1] for r in rows] + [rows[-1].bbox[3]]
+        tw = [w for w in words if inside(w, t.bbox)]
+        cells = []
+        for ri, row in enumerate(rows):
+            for bb in row.cells:
+                if bb is None:
+                    continue
+                r1 = ri
+                while r1 + 1 < len(rows) and tops[r1 + 1] < bb[3] - 2:
+                    r1 += 1
+                inner = [w for w in tw if inside(w, bb) and not w.get("_used")]
+                for w in inner:
+                    w["_used"] = True
+                cells.append({"bb": bb, "r0": ri, "r1": r1, "words": inner})
+        # words sitting on a cell border -> nearest cell
+        for w in tw:
+            if w.get("_used"):
+                continue
+            cx, cy = (w["x0"] + w["x1"]) / 2, (w["top"] + w["bottom"]) / 2
+
+            def dist(c):
+                x0, y0, x1, y1 = c["bb"]
+                return max(x0 - cx, 0, cx - x1) + max(y0 - cy, 0, cy - y1)
+
+            if cells:
+                c = min(cells, key=dist)
+                if dist(c) <= 8:
+                    c["words"].append(w)
+                    w["_used"] = True
+        # columns under a "Rate" / "Rs" header hold rates
+        rate_x = []
+        for c in cells:
+            if c["r0"] <= 3 and c["words"]:
+                txt = " ".join(w["text"] for w in c["words"])
+                if re.search(r"\b(Rate|Rates|Rs\.?|Amount)\b", txt, re.I) and len(txt) < 60:
+                    rate_x.append((c["bb"][0] - 1, c["bb"][2] + 1))
+        # continuation page without the header: same table layout as before -> same rate columns
+        prev = ROAD_STATE.get("rate_tab")
+        if rate_x:
+            ROAD_STATE["rate_tab"] = (t.bbox[0], t.bbox[2], rate_x, pg.page_number)
+        elif prev and abs(prev[0] - t.bbox[0]) < 6 and abs(prev[1] - t.bbox[2]) < 6 and \
+                pg.page_number - prev[3] <= 3:
+            rate_x = prev[2]
+            ROAD_STATE["rate_tab"] = (prev[0], prev[1], prev[2], pg.page_number)
+        tabs.append({"bbox": t.bbox, "tops": tops, "cells": cells, "rate_x": rate_x})
+
+    free = [w for w in words if not w.get("_used")]
+    lines = group_lines(free)
+    footer = [ln for ln in lines if is_footer(ln, pg.height, kind)]
+    body = [ln for ln in lines if ln not in footer]
+
+    bounds = None
+    if kind == "road":
+        hl, bounds = road_header(body)
+        if bounds:
+            ROAD_STATE["bounds"] = bounds
+            ROAD_STATE["last"] = pg.page_number
+        elif ROAD_STATE.get("last") == pg.page_number - 1:
+            bounds = ROAD_STATE["bounds"]
+            ROAD_STATE["last"] = pg.page_number
+
+    def chunks_of(ln):
+        ws = ln["words"]
+        out = split_table_line(ws)
+        if bounds:  # also cut at the road column boundaries
+            cuts = [bounds["item"], bounds["unit"], bounds["rate"]]
+            res = []
+            for ch in out:
+                cur = [ch[0]]
+                for a, b in zip(ch, ch[1:]):
+                    if any(a["x1"] <= c <= b["x0"] + 2 or ((a["x0"] + a["x1"]) / 2 < c <= (b["x0"] + b["x1"]) / 2)
+                           for c in cuts):
+                        res.append(cur)
+                        cur = [b]
+                    else:
+                        cur.append(b)
+                res.append(cur)
+            out = res
+        return out
+
+    def mk_lines(lns):
+        res = []
+        for ln in lns:
+            chs = []
+            for ch in chunks_of(ln):
+                fn, sz, col = word_info(ch)
+                chs.append({"x0": ch[0]["x0"], "x1": max(w["x1"] for w in ch),
+                            "text": fix_text(" ".join(w["text"] for w in ch)), "font": fn, "size": sz,
+                            "color": col})
+            res.append({"top": ln["top"], "bottom": ln["bottom"], "chunks": chs})
+        return res
+
+    # pictures
+    page_area = pg.width * pg.height
+    imgs = []
+    for im in pg.images:
+        x0, t, x1, bt = max(im["x0"], 0), max(im["top"], 0), min(im["x1"], pg.width), min(im["bottom"], pg.height)
+        if x1 - x0 < 8 or bt - t < 8:
+            continue
+        if (x1 - x0) * (bt - t) > 0.6 * page_area and len(words) > 60:
+            continue  # background behind text
+        imgs.append((x0, t, x1, bt))
+
+    # ruled lines outside tables (header rules, footer bars, underlines of titles)
+    rules = []
+    segs = [(l["x0"], l["x1"], (l["top"] + l["bottom"]) / 2, max(l.get("linewidth") or 0.5, 0.5),
+             l.get("stroking_color")) for l in pg.lines if abs(l["bottom"] - l["top"]) < 1.5]
+    segs += [(r["x0"], r["x1"], r["top"], r["bottom"] - r["top"], r.get("non_stroking_color"))
+             for r in pg.rects if (r["bottom"] - r["top"]) <= 8 and r.get("fill", True)]
+    for x0, x1, y, lw, col in segs:
+        if x1 - x0 < 20 or rgb_hex(col) == "FFFFFF":
+            continue
+        if any(t["bbox"][0] - 2 <= (x0 + x1) / 2 <= t["bbox"][2] + 2 and t["bbox"][1] - 2 <= y <= t["bbox"][3] + 2
+               for t in tabs):
+            continue
+        rules.append((x0, x1, y, lw, rgb_hex(col)))
+    # merge rules that continue each other on the same y
+    rules.sort(key=lambda r: (round(r[2]), r[0]))
+    merged = []
+    for r in rules:
+        if merged and abs(merged[-1][2] - r[2]) < 1.5 and r[0] <= merged[-1][1] + 3:
+            m = merged[-1]
+            merged[-1] = (m[0], max(m[1], r[1]), m[2], max(m[3], r[3]), m[4] or r[4])
+        else:
+            merged.append(r)
+
+    # vertical bars / lines (sides of page frames, column rules of un-ruled tables)
+    vrules = []
+    vs = [(r["top"], r["bottom"], (r["x0"] + r["x1"]) / 2, r["x1"] - r["x0"], r.get("non_stroking_color"))
+          for r in pg.rects if (r["x1"] - r["x0"]) <= 4 and (r["bottom"] - r["top"]) >= 20]
+    vs += [(l["top"], l["bottom"], l["x0"], max(l.get("linewidth") or 0.5, 0.5), l.get("stroking_color"))
+           for l in pg.lines if abs(l["x1"] - l["x0"]) < 1.5 and (l["bottom"] - l["top"]) >= 20]
+    for t, bt, x, lw, col in vs:
+        if rgb_hex(col) == "FFFFFF":
+            continue
+        if any(tb["bbox"][0] - 2 <= x <= tb["bbox"][2] + 2 and tb["bbox"][1] - 2 <= (t + bt) / 2 <= tb["bbox"][3] + 2
+               for tb in tabs):
+            continue
+        if vrules and abs(vrules[-1][2] - x) < 2 and abs(vrules[-1][0] - t) < 3:
+            continue
+        vrules.append((t, bt, x, lw, rgb_hex(col)))
+    frames = []
+    for r in pg.rects:
+        x0, t, x1, bt = r["x0"], r["top"], r["x1"], r["bottom"]
+        if bt - t <= 4 or x1 - x0 < 20 or not r.get("stroke", True):
+            continue
+        if any(abs(x0 - tb["bbox"][0]) < 4 and abs(t - tb["bbox"][1]) < 4 for tb in tabs):
+            continue
+        if any(tb["bbox"][0] - 2 <= x0 and x1 <= tb["bbox"][2] + 2 and tb["bbox"][1] - 2 <= t and bt <= tb["bbox"][3] + 2
+               for tb in tabs):
+            continue
+        frames.append((x0, t, x1, bt, max(r.get("linewidth") or 0.5, 0.5), rgb_hex(r.get("stroking_color"))))
+    hdr_words = {"Item", "No.", "Description", "Unit", "Rate", "S.No.", "(Rs.)"}
+    body_words = sum(1 for ln in body for w in ln["words"] if w["text"] not in hdr_words) + sum(
+        len(c["words"]) for t in tabs for c in t["cells"])
+    img_area = sum((b[2] - b[0]) * (b[3] - b[1]) for b in imgs)
+    scan = (body_words == 0 and img_area > 0.1 * page_area) or (body_words < 40 and img_area > 0.7 * page_area)
+
+    footer_blk = None
+    if footer:
+        fl = sorted(footer, key=lambda l: l["top"])
+        footer_blk = {"chunks": [(c[0]["x0"], fix_text(" ".join(w["text"] for w in c)))
+                                 for ln in fl for c in split_gaps(ln["words"], 25)]}
+    xs = [w["x0"] for w in words] + [t["bbox"][0] for t in tabs] + [b[0] for b in imgs]
+    xe = [w["x1"] for w in words] + [t["bbox"][2] for t in tabs] + [b[2] for b in imgs]
+    return {
+        "w": pg.width, "h": pg.height, "landscape": pg.width > pg.height,
+        "lines": attach_rates(mk_lines(body), bounds), "footer_lines": mk_lines(footer), "tables": tabs,
+        "imgs": imgs, "kind": kind,
+        "rules": merged, "vrules": vrules, "frames": frames, "road_bounds": bounds, "scan": scan, "footer": footer_blk,
+        "footer_text": " ".join(ln["text"] for ln in footer),
+        "top_lines": [ln["text"] for ln in sorted(body, key=lambda l: l["top"])[:8]],
+        "left": min(xs) if xs else 40, "right": max(xe) if xe else pg.width - 40,
+    }
+
+
+class AbsGrid:
+    """Column edges shared by all pages of one sheet."""
+
+    def __init__(self, pages):
+        xs = []
+        for p in pages:
+            for t in p["tables"]:
+                for c in t["cells"]:
+                    xs += [c["bb"][0], c["bb"][2]]
+            for ln in p["lines"] + p["footer_lines"]:
+                for ch in ln["chunks"]:
+                    xs.append(ch["x0"])
+                    if looks_like_rate(ch["text"]) or NUM_RE.match(ch["text"].strip()):
+                        xs.append(ch["x1"])
+            for b in p["imgs"]:
+                xs += [b[0], b[2]]
+            for r in p["rules"]:
+                xs += [r[0], r[1]]
+            for f in p.get("frames", []):
+                xs += [f[0], f[2]]
+            for v in p.get("vrules", []):
+                xs.append(v[2])
+            xs += [p["left"], p["right"]]
+        xs = sorted(xs) or [40, 550]
+        groups = []
+        for x in xs:
+            if groups and x - groups[-1][-1] <= 2.5:
+                groups[-1].append(x)
+            else:
+                groups.append([x])
+        edges = [min(g) if len(g) < 3 else sorted(g)[len(g) // 2] for g in groups]
+        clean = [edges[0]]
+        for x in edges[1:]:
+            if x - clean[-1] >= 3:
+                clean.append(x)
+        if len(clean) < 2:
+            clean.append(clean[0] + 500)
+        self.edges = clean
+        self.ncols = len(clean) - 1
+        self.left, self.right = clean[0], clean[-1]
+
+    def col_at(self, x):
+        best = 0
+        for i, e in enumerate(self.edges[:-1]):
+            if e <= x + 1.5:
+                best = i
+        return best + 1
+
+    def col_end(self, x):
+        best = 1
+        for i, e in enumerate(self.edges[1:], start=1):
+            if e <= x + 1.5:
+                best = i
+        return max(best, 1)
+
+    def x_of(self, col):
+        return self.edges[col - 1]
+
+
+def text_width_pt(text, ft):
+    f = _font_named(ft.name, ft.sz or 10, bool(ft.b))
+    if f is None:
+        return len(text) * (ft.sz or 10) * 0.5
+    return f.getlength(text) / 4 * 0.75
+
+
+_FONT_FILES2 = {
+    "serif": ("LiberationSerif-Regular.ttf", "LiberationSerif-Bold.ttf"),
+    "sans": ("LiberationSans-Regular.ttf", "LiberationSans-Bold.ttf"),
+}
+
+
+def _font_named(name, size, bold):
+    fam = "serif"
+    key = ("n", fam, bold, round(size * 2))
+    if key not in _FONTS:
+        try:
+            from PIL import ImageFont
+            fn = _FONT_FILES2[fam][1 if bold else 0]
+            _FONTS[key] = ImageFont.truetype("/usr/share/fonts/truetype/liberation/" + fn,
+                                             max(1, round(size * 96 / 72 * 4)))
+        except Exception:
+            _FONTS[key] = None
+    return _FONTS[key]
+
+
+class AbsWriter:
+    def __init__(self, ws, title, pages, use_footer_rows):
+        self.ws, self.title, self.pages = ws, title, pages
+        self.g = AbsGrid(pages)
+        self.r = 1
+        self.heights = {}
+        self.page_rows = []
+        self.use_footer_rows = use_footer_rows
+        self.extra = []  # (r0, r1, need_pt) for merged cells
+        for c in range(1, self.g.ncols + 1):
+            pt = self.g.edges[c] - self.g.edges[c - 1]
+            ws.column_dimensions[get_column_letter(c)].width = round(pt / 0.75 / 7, 3)
+        tops = []
+        for p in pages:
+            ys = self._content_ys(p)
+            if ys:
+                tops.append(min(ys))
+        self.mt = max(min(tops) - 2, 0) if tops else 30
+
+    def _content_ys(self, p):
+        ys = [ln["top"] for ln in p["lines"]]
+        if self.use_footer_rows:
+            ys += [ln["top"] for ln in p["footer_lines"]]
+        for t in p["tables"]:
+            ys += t["tops"]
+        for b in p["imgs"]:
+            ys += [b[1], b[3]]
+        ys += [r[2] for r in p["rules"]]
+        for f in p.get("frames", []):
+            ys += [f[1], f[3]]
+        for v in p.get("vrules", []):
+            ys += [v[0], v[1]]
+        return ys
+
+    # ---------------------------------------------------------------- one page
+    def page(self, p, scan_png=None):
+        ws, g = self.ws, self.g
+        r_start = self.r
+        if scan_png:
+            bps = [self.mt, p["h"] - self.mt]
+            lines, tables, imgs, rules = [], [], [], []
+        else:
+            lines = p["lines"] + (p["footer_lines"] if self.use_footer_rows else [])
+            tables, imgs, rules = p["tables"], p["imgs"], p["rules"]
+            ys = self._content_ys(p)
+            ends = [ln["bottom"] + 1 for ln in lines] + [b[3] for b in imgs] + [r[2] + 1 for r in rules] + \
+                [f[3] + 1 for f in p.get("frames", [])]
+            for t in tables:
+                ends.append(t["tops"][-1])
+            bps = sorted(set([round(y, 1) for y in ys] + [round(max(ends), 1) if ends else self.mt + 10]))
+        # text printed a few points above/below its neighbour (markers, rates) shares its row
+        hard = set()
+        for t in tables:
+            hard.update(round(v, 1) for v in t["tops"])
+        for r_ in rules:
+            hard.add(round(r_[2], 1))
+        for f_ in p.get("frames", []):
+            hard.update((round(f_[1], 1), round(f_[3], 1)))
+        merged = []
+        for y in bps:
+            if merged and (y - merged[-1] < 1.2 or (y - merged[-1] < 5 and y not in hard and merged[-1] not in hard)):
+                continue
+            merged.append(y)
+        bps = merged
+        # spacer from the common top margin to the first item
+        if bps and bps[0] - self.mt > 0.8:
+            bps = [self.mt] + bps
+        # Excel rows are at most 409 pt tall: split big empty gaps
+        split = []
+        for k, y in enumerate(bps):
+            if split:
+                while y - split[-1] > 200:
+                    split.append(split[-1] + 200)
+            split.append(y)
+        bps = split
+        if len(bps) < 2:
+            bps.append(bps[0] + 12)
+        row_of_bp = {}
+        for k in range(len(bps) - 1):
+            self.heights[self.r + k] = bps[k + 1] - bps[k]
+            row_of_bp[k] = self.r + k
+        last = self.r + len(bps) - 2
+
+        def row(y):
+            k = 0
+            for i, b in enumerate(bps[:-1]):
+                if b <= y + 0.75:
+                    k = i
+            return self.r + k
+
+        occupied = {}
+
+        # ---- tables
+        for t in tables:
+            for c in t["cells"]:
+                x0, y0, x1, y1 = c["bb"]
+                R0 = row(t["tops"][c["r0"]])
+                R1 = max(R0, row(t["tops"][c["r1"] + 1]) - 1)
+                c0, c1 = g.col_at(x0), max(g.col_at(x0), g.col_end(x1))
+                while (R0, c0) in occupied and c0 < c1:  # snapped onto the neighbour: move right
+                    c0 += 1
+                if (R0, c0) in occupied:
+                    if c["words"]:  # nowhere to go: keep the text in the neighbouring cell
+                        anc = ws.cell(*occupied[(R0, c0)])
+                        extra = keep_lines([ln["text"] for ln in group_lines(c["words"])])
+                        anc.value = f"{anc.value}  {extra}" if anc.value not in (None, "") else extra
+                    continue
+                free = [cc for cc in range(c0, c1 + 1) if all((rr, cc) not in occupied for rr in range(R0, R1 + 1))]
+                if len(free) != c1 - c0 + 1:
+                    c1 = c0
+                    if any((rr, c0) in occupied for rr in range(R0, R1 + 1)):
+                        R1 = R0
+                for rr in range(R0, R1 + 1):
+                    for cc in range(c0, c1 + 1):
+                        occupied[(rr, cc)] = (R0, c0)
+                        ws.cell(rr, cc).border = BORDER
+                if R1 > R0 or c1 > c0:
+                    ws.merge_cells(start_row=R0, start_column=c0, end_row=R1, end_column=c1)
+                cell = ws.cell(R0, c0)
+                cell.border = BORDER
+                wds = c["words"]
+                if not wds:
+                    continue
+                lns = group_lines(wds)
+                text = keep_lines([ln["text"] for ln in lns])
+                fn, sz, col = word_info(wds)
+                val = text
+                cx = (x0 + x1) / 2
+                in_rate_col = any(a <= cx <= b for a, b in t.get("rate_x", []))
+                if looks_like_rate(text) and (in_rate_col or not t.get("rate_x") and NO_HEADER_RATES):
+                    val = to_number(text)
+                ft = font_of(fn, sz, col)
+                width = x1 - x0
+                # keep every PDF line on one Excel line: shrink the font a little if needed
+                avail = width - 4
+                widest = max((text_width_pt(l, ft) for l in str(text).split("\n")), default=0)
+                if widest > avail > 0:
+                    ft = font_of(fn, max(4, sz * avail / widest * 0.98), col)
+                cell.value = val
+                cell.font = ft
+                if isinstance(val, (int, float)):
+                    cell.number_format = rupee_fmt(text)
+                ha = cell_align(lns, x0, x1, isinstance(val, (int, float)))
+                vtop = min(w["top"] for w in wds) - y0
+                vbot = y1 - max(w["bottom"] for w in wds)
+                va = "center" if abs(vtop - vbot) < 3 and vtop > 4 else ("bottom" if vbot < vtop - 3 else "top")
+                cell.alignment = Alignment(horizontal=ha, vertical=va, wrap_text=not isinstance(val, (int, float)),
+                                           shrink_to_fit=isinstance(val, (int, float)))
+                need = len(lns) * (ft.sz or 10) * 1.17 + 2
+                self.extra.append((R0, R1, need, cell))
+
+        # ---- road SOR item list: the description of each item / sub-item goes in ONE cell
+        #      (PDF line breaks kept), so a row copied from Item No. to Rate pastes cleanly
+        done = set()
+        bd = p.get("road_bounds")
+        if bd and lines:
+            def is_desc(ch):
+                cx = (ch["x0"] + ch["x1"]) / 2
+                return bd["item"] <= cx < bd["unit"]
+
+            recs, cur = [], None
+            for ln in sorted(lines, key=lambda l: l["top"]):
+                if ln["top"] > p["h"] * 0.88 or max(c["size"] for c in ln["chunks"]) >= 13:
+                    cur = None
+                    continue
+                txt = " ".join(c["text"] for c in ln["chunks"])
+                if "Description" in txt and "Rate" in txt:
+                    cur = None
+                    continue
+                desc = [c for c in ln["chunks"] if is_desc(c)]
+                item = [c for c in ln["chunks"] if (c["x0"] + c["x1"]) / 2 < bd["item"]]
+                bold = bool(desc) and "bold" in desc[0]["font"].lower()
+                first = desc[0]["text"] if desc else ""
+                marker = bool(re.match(r"^(\(?[ivxIVX]{1,5}\)|\(?[a-hA-H]\)|[A-H]\s|[1-9]\s|Note)", first)) or \
+                    bool(re.fullmatch(r"\(?([ivxlIVXL]{1,6}|[a-hA-H]|\d{1,2})[.)]?", first.strip())) or \
+                    bool(re.match(r"^[ivxl]{1,6}\.?\s+[A-Z(@]", first))
+                has_rate = any((c["x0"] + c["x1"]) / 2 >= bd["unit"] for c in ln["chunks"])
+                if cur is None or item or marker or (desc and cur["bold"] != bold and cur["desc"]) or \
+                        (has_rate and cur["rate"]):
+                    cur = {"lines": [], "desc": [], "bold": bold, "rate": False}
+                    recs.append(cur)
+                cur["rate"] = cur["rate"] or has_rate
+                cur["lines"].append(ln)
+                cur["desc"] += [(ln, c) for c in desc]
+            for rec in recs:
+                if not rec["desc"]:
+                    continue
+                by_line = {}
+                for ln, c in rec["desc"]:
+                    by_line.setdefault(id(ln), (ln, []))[1].append(c)
+                parts = [" ".join(c["text"] for c in cs) for ln, cs in
+                         sorted(by_line.values(), key=lambda v: v[0]["top"])]
+                R0 = row(rec["desc"][0][0]["top"])
+                R1 = row(rec["desc"][-1][0]["top"])
+                c0 = g.col_at(min(c["x0"] for _, c in rec["desc"]))
+                others = [c["x0"] for ln in rec["lines"] for c in ln["chunks"]
+                          if not is_desc(c) and c["x0"] > min(cc["x1"] for _, cc in rec["desc"]) - 1]
+                stop = min([bd["unit"]] + others)
+                c1 = max(c0, g.col_at(stop) - 1 if g.x_of(g.col_at(stop)) >= stop - 1.5 else g.col_at(stop) - 1)
+                span = [(rr, cc) for rr in range(R0, R1 + 1) for cc in range(c0, c1 + 1)]
+                if any(sp in occupied for sp in span):
+                    continue
+                for sp in span:
+                    occupied[sp] = (R0, c0)
+                if R1 > R0 or c1 > c0:
+                    ws.merge_cells(start_row=R0, start_column=c0, end_row=R1, end_column=c1)
+                c = rec["desc"][0][1]
+                cell = ws.cell(R0, c0, keep_lines(parts))
+                cell.font = font_of(c["font"], c["size"], c["color"])
+                cell.alignment = Alignment(horizontal="left", vertical="top", wrap_text=True)
+                self.extra.append((R0, R1, len(parts) * c["size"] * 1.17 + 2, cell))
+                for _, c in rec["desc"]:
+                    done.add(id(c))
+
+        # ---- free text lines (one PDF line = one Excel row)
+        for ln in lines:
+            R = row(ln["top"])
+            chs = ln["chunks"]
+            for k, ch in enumerate(chs):
+                if id(ch) in done:
+                    continue
+                c0 = g.col_at(ch["x0"])
+                if (R, c0) in occupied:  # landed on a filled cell: next free one, else append
+                    nxt = next((cc for cc in range(c0 + 1, g.ncols + 1) if (R, cc) not in occupied), None)
+                    if nxt is None:
+                        anc = ws.cell(*occupied[(R, c0)])
+                        anc.value = f"{anc.value} {ch['text']}" if anc.value not in (None, "") else ch["text"]
+                        continue
+                    c0 = nxt
+                txt = ch["text"]
+                val = to_number(txt) if (looks_like_rate(txt) and (k > 0 or len(chs) == 1 and ch["x0"] > g.left + 0.5 * (g.right - g.left))
+                                         or (k > 0 and p.get("kind") == "road" and re.fullmatch(r"\d[\d,]*\.\d+", txt.strip()))) else txt
+                ft = font_of(ch["font"], ch["size"], ch["color"])
+                if isinstance(val, (int, float)):
+                    # numbers do not overflow: give them room up to the next text, right aligned at x1
+                    c1 = g.col_end(ch["x1"])
+                    left_lim = g.col_at(chs[k - 1]["x1"]) + 1 if k else 1
+                    cs = max(left_lim, min(c0, c1))
+                    while cs > left_lim and (R, cs - 1) not in occupied and \
+                            g.x_of(c1 + 1) - g.x_of(cs) < text_width_pt("₹ " + txt, ft) + 6:
+                        cs -= 1
+                    span = [(R, cc) for cc in range(cs, c1 + 1)]
+                    if any(s in occupied for s in span):
+                        cs, c1 = c0, c0
+                    for s in [(R, cc) for cc in range(cs, c1 + 1)]:
+                        occupied[s] = (R, cs)
+                    if c1 > cs:
+                        ws.merge_cells(start_row=R, start_column=cs, end_row=R, end_column=c1)
+                    cell = ws.cell(R, cs, val)
+                    cell.number_format = rupee_fmt(txt)
+                    cell.alignment = Alignment(horizontal="right", vertical="top", shrink_to_fit=True)
+                else:
+                    occupied[(R, c0)] = (R, c0)
+                    cell = ws.cell(R, c0, val)
+                    cell.alignment = Alignment(horizontal="left", vertical="top")
+                cell.font = ft
+                self.extra.append((R, R, (ft.sz or 10) * 1.05, cell))
+
+        # ---- ruled lines
+        for x0, x1, y, lw, colr in rules:
+            R = row(y)
+            if abs(bps[R - self.r] - y) > 1.5 and R < last:
+                R = R + 1 if abs(bps[min(R - self.r + 1, len(bps) - 1)] - y) < 1.5 else R
+            st = "thick" if lw >= 2.2 else ("medium" if lw >= 1.2 else "thin")
+            side = Side(style=st, color=colr or "000000")
+            for cc in range(g.col_at(x0), g.col_end(x1) + 1):
+                cell = ws.cell(R, cc)
+                b = cell.border
+                cell.border = Border(left=b.left, right=b.right, top=side, bottom=b.bottom)
+
+        # ---- vertical rules: left border of the column starting at x
+        if not scan_png:
+            for t, bt, x, lw, colr in p.get("vrules", []):
+                st = "thick" if lw >= 2.2 else ("medium" if lw >= 1.2 else "thin")
+                side = Side(style=st, color=colr or "000000")
+                k = min(range(len(g.edges)), key=lambda i: abs(g.edges[i] - x))
+                if abs(g.edges[k] - x) > 4:
+                    continue
+                c, edge = (k + 1, "left") if k < g.ncols else (g.ncols, "right")
+                for rr in range(row(t), row(bt)):
+                    cell = ws.cell(rr, c)
+                    b = cell.border
+                    kw = {"left": b.left, "right": b.right, "top": b.top, "bottom": b.bottom}
+                    kw[edge] = side
+                    cell.border = Border(**kw)
+
+        # ---- frames (boxes drawn round titles / pages)
+        if not scan_png:
+            for x0, t, x1, bt, lw, colr in p.get("frames", []):
+                st = "thick" if lw >= 2.2 else ("medium" if lw >= 1.2 else "thin")
+                side = Side(style=st, color=colr or "000000")
+                ra, rb = row(t), row(bt)
+                ca, cb = g.col_at(x0), max(g.col_at(x0), g.col_end(x1))
+                for rr in range(ra, rb):
+                    for cc, edge in ((ca, "left"), (cb, "right")):
+                        cell = ws.cell(rr, cc)
+                        b = cell.border
+                        kw = {"left": b.left, "right": b.right, "top": b.top, "bottom": b.bottom}
+                        kw[edge] = side
+                        cell.border = Border(**kw)
+                for cc in range(ca, cb + 1):
+                    for rr, edge in ((ra, "top"), (rb, "top")):
+                        cell = ws.cell(rr, cc)
+                        b = cell.border
+                        kw = {"left": b.left, "right": b.right, "top": b.top, "bottom": b.bottom}
+                        kw[edge] = side
+                        cell.border = Border(**kw)
+
+        # ---- pictures
+        if scan_png:
+            self._place(scan_png, self.r, 1, 0, p["w"] * 0.0 + (g.right - g.left), (g.right - g.left) * p["h"] / p["w"])
+        for (x0, t, x1, bt), path in zip(imgs, p.get("img_paths", [])):
+            R = row(t)
+            c = g.col_at(x0)
+            self._place(path, R, c, x0 - g.x_of(c), x1 - x0, bt - t, t - bps[R - self.r])
+
+        self.r = last + 1
+        self.ws.row_breaks.append(Break(id=last))
+        self.page_rows.append((r_start, last))
+        return r_start, last
+
+    def _place(self, path, row, col, x_off, w_pt, h_pt, y_off=0.0):
+        from openpyxl.drawing.image import Image as XLImage
+        from openpyxl.drawing.spreadsheet_drawing import AnchorMarker, OneCellAnchor
+        from openpyxl.drawing.xdr import XDRPositiveSize2D
+        img = XLImage(path)
+        emu = 12700
+        img.anchor = OneCellAnchor(
+            _from=AnchorMarker(col=col - 1, colOff=int(max(x_off, 0) * emu), row=row - 1,
+                               rowOff=int(max(y_off, 0) * emu)),
+            ext=XDRPositiveSize2D(int(w_pt * emu), int(h_pt * emu)))
+        self.ws.add_image(img)
+
+    def finish(self, landscape):
+        ws = self.ws
+        # merged / wrapped cells must be tall enough for their lines
+        for r0, r1, need, cell in self.extra:
+            have = sum(self.heights.get(r, MIN_ROW) for r in range(r0, r1 + 1))
+            if need > have + 0.5:
+                # Excel's line height is a bit taller than the PDF's line spacing: prefer a slightly
+                # smaller font (max 15 %) over taller rows, so every page keeps the PDF's height
+                f = (have - 2) / max(need - 2, 1)
+                ft = cell.font
+                if f >= 0.85 and ft is not None and ft.sz:
+                    nf = copy(ft)
+                    nf.sz = max(4.0, math.floor(ft.sz * f * 2) / 2)
+                    cell.font = nf
+                    lines_ = (need - 2) / (ft.sz * 1.17) if ft.sz else 1
+                    need = lines_ * nf.sz * 1.17 + 2
+                if need > have + 0.5:
+                    self.heights[r1] = self.heights.get(r1, MIN_ROW) + (need - have)
+        for r, h in self.heights.items():
+            ws.row_dimensions[r].height = round(max(h, 0.75), 2)
+        ws.sheet_format.defaultRowHeight = MIN_ROW
+        ws.sheet_format.customHeight = True
+        ws.sheet_view.showGridLines = False
+        # paper like the PDF: A4 or Letter, same orientation; same margins
+        pw = max(p["w"] for p in self.pages)
+        ph = max(p["h"] for p in self.pages)
+        short, long_ = min(pw, ph), max(pw, ph)
+        paper = 1 if abs(short / long_ - 612 / 792) < abs(short / long_ - 595.3 / 841.9) else 9
+        ps, pl = PAPERS[paper]
+        f = min(ps / short, pl / long_)  # PDF -> paper scale
+        paper_w, paper_h = (pl, ps) if landscape else (ps, pl)
+        ws.page_setup.paperSize = paper
+        ws.page_setup.orientation = "landscape" if landscape else "portrait"
+        g = self.g
+        left = max(g.left * f, 14)
+        content_w = (g.right - g.left) * f
+        top = max(self.mt * f, 18)
+        bottom = 36
+        scale = f
+        # never let a PDF page spill onto two printed pages
+        for r0, r1 in self.page_rows:
+            h = sum(self.heights.get(r, MIN_ROW) for r in range(r0, r1 + 1))
+            if h * scale > paper_h - top - bottom:
+                scale = (paper_h - top - bottom) / h
+        if content_w / f * scale > paper_w - left - 10:
+            scale = (paper_w - left - 10) / (content_w / f)
+        ws.sheet_properties.pageSetUpPr.fitToPage = False
+        scale *= 0.96  # slack: Excel / LibreOffice round row heights and column widths to pixels
+        ws.page_setup.scale = max(10, min(400, int(scale * 100)))
+        ws.page_margins.left = round(left / 72, 3)
+        ws.page_margins.right = 0.1
+        ws.page_margins.top = round(top / 72, 3)
+        ws.page_margins.bottom = round(bottom / 72, 3)
+        ws.page_margins.header = 0.2
+        ws.page_margins.footer = 0.2
+        ws.print_options.horizontalCentered = False
+        ws.print_area = f"A1:{get_column_letter(g.ncols)}{max(self.r - 1, 1)}"
+
+
+def normalise(p):
+    """Pages printed at an odd size (e.g. 913 x 1182 pt) are scaled to Letter/A4 size,
+    so every page of a sheet shares one scale and looks like the PDF."""
+    w, h = p["w"], p["h"]
+    short, long_ = min(w, h), max(w, h)
+    if short <= 625 and long_ <= 860:
+        return
+    k = min(612 / short, 842 / long_) if abs(short / long_ - 612 / 792) < 0.04 else min(595.3 / short, 841.9 / long_)
+    if abs(short / long_ - 612 / 792) < 0.04:
+        k = 612 / short
+    sc = lambda v: v * k
+    p["w"], p["h"], p["left"], p["right"] = w * k, h * k, p["left"] * k, p["right"] * k
+    for ln in p["lines"] + p["footer_lines"]:
+        ln["top"], ln["bottom"] = sc(ln["top"]), sc(ln["bottom"])
+        for ch in ln["chunks"]:
+            ch["x0"], ch["x1"], ch["size"] = sc(ch["x0"]), sc(ch["x1"]), ch["size"] * k
+    for t in p["tables"]:
+        t["bbox"] = tuple(sc(v) for v in t["bbox"])
+        t["tops"] = [sc(v) for v in t["tops"]]
+        t["rate_x"] = [(sc(a), sc(b)) for a, b in t.get("rate_x", [])]
+        for c in t["cells"]:
+            c["bb"] = tuple(sc(v) for v in c["bb"])
+            for wd in c["words"]:
+                for key in ("x0", "x1", "top", "bottom"):
+                    wd[key] = sc(wd[key])
+                wd["size"] = wd["size"] * k
+    p["imgs"] = [tuple(sc(v) for v in b) for b in p["imgs"]]
+    p["rules"] = [(sc(a), sc(b), sc(y), lw * k, c) for a, b, y, lw, c in p["rules"]]
+    p["frames"] = [(sc(a), sc(t), sc(b), sc(bt), lw * k, c) for a, t, b, bt, lw, c in p.get("frames", [])]
+    p["vrules"] = [(sc(t), sc(bt), sc(x), lw * k, c) for t, bt, x, lw, c in p.get("vrules", [])]
+    if p.get("road_bounds"):
+        p["road_bounds"] = {kk: sc(v) for kk, v in p["road_bounds"].items()}
+
+
+def attach_rates(lines, bounds):
+    """Road SOR: a line holding only Unit / Rate (printed half a line off) joins the
+    description line it belongs to, so the rate sits on its item's row."""
+    if not bounds:
+        return lines
+
+    def is_ur(c):
+        return (c["x0"] + c["x1"]) / 2 >= bounds["unit"]
+
+    ur = [ln for ln in lines if ln["chunks"] and all(is_ur(c) for c in ln["chunks"])]
+    rest = [ln for ln in lines if ln not in ur]
+    for ul in ur:
+        def has_rate(ln):
+            return any(is_ur(c) and NUM_RE.match(c["text"].replace(",", "").strip()) for c in ln["chunks"])
+        def has_unit(ln):
+            return any(is_ur(c) and not NUM_RE.match(c["text"].replace(",", "").strip()) for c in ln["chunks"])
+
+        rate_only = all(NUM_RE.match(c["text"].replace(",", "").strip()) for c in ul["chunks"])
+        near = [ln for ln in rest if abs(ln["top"] - ul["top"]) <= (20 if rate_only else 12) and not has_rate(ln)]
+        # a line that already has its Unit but no rate is the rate's line; otherwise the line just below
+        if rate_only and any(has_unit(ln) for ln in near):
+            near = [ln for ln in near if has_unit(ln)]
+        near = [ln for ln in near if abs(ln["top"] - ul["top"]) <= 12 or has_unit(ln)]
+        tgt = min(near, key=lambda l: (abs(l["top"] - ul["top"]), l["top"] < ul["top"])) if near else None
+        if tgt is None:
+            rest.append(ul)
+            continue
+        tgt["chunks"] = sorted(tgt["chunks"] + ul["chunks"], key=lambda c: c["x0"])
+    rest = sorted(rest, key=lambda l: l["top"])
+
+    # numbered groups printed with every rate half a line too high:
+    #   "(i) Solid Slab"  <rate a> / "1 Height .." <rate b> / ... / "4 Height .." (no rate)
+    # -> each rate belongs one line lower; the heading gets none
+    def marker(ln):
+        d = [c for c in ln["chunks"] if bounds["item"] <= (c["x0"] + c["x1"]) / 2 < bounds["unit"]]
+        m = re.match(r"^(\d{1,2})\s", d[0]["text"] + " ") if d else None
+        return int(m.group(1)) if m else None
+
+    def ur_chunks(ln):
+        return [c for c in ln["chunks"] if is_ur(c)]
+
+    i = 0
+    while i < len(rest) - 1:
+        h = rest[i]
+        if ur_chunks(h) and marker(h) is None and marker(rest[i + 1]) == 1:
+            j = i + 1
+            while j + 1 < len(rest) and marker(rest[j + 1]) == marker(rest[j]) + 1:
+                j += 1
+            grp = rest[i:j + 1]
+            if not ur_chunks(grp[-1]) and all(ur_chunks(g) for g in grp[:-1]):
+                moved = [ur_chunks(g) for g in grp]
+                for g in grp:
+                    g["chunks"] = [c for c in g["chunks"] if not is_ur(c)]
+                for k in range(1, len(grp)):
+                    grp[k]["chunks"] = sorted(grp[k]["chunks"] + moved[k - 1], key=lambda c: c["x0"])
+            i = j + 1
+        else:
+            i += 1
+    return rest
+
+
+def rupee_fmt(txt):
+    """₹ format that shows exactly the decimals printed in the PDF (and thousands commas if used)."""
+    t = txt.strip()
+    dec = len(t.split(".")[1]) if "." in t else 0
+    base = "#,##0" if "," in t else "0"
+    return '"₹ "' + base + ("." + "0" * dec if dec else "")
+
+
+def cell_align(lns, x0, x1, numeric):
+    """Horizontal alignment of a PDF cell from where its lines sit."""
+    if numeric:
+        return "right"
+    lefts = [ln["x0"] - x0 for ln in lns]
+    rights = [x1 - ln["x1"] for ln in lns]
+    if len(lns) >= 2:
+        sl = max(lefts) - min(lefts)
+        sr = max(rights) - min(rights)
+        mids = [(a - b) for a, b in zip(lefts, rights)]
+        if min(lefts) > 3 and max(abs(m) for m in mids) <= 6 and not (sl <= 1 and sr <= 1 and min(lefts) < 8):
+            return "center"
+        if sl <= 3:
+            return "left"
+        if sr <= 3:
+            return "right"
+        return "left"
+    l, r = lefts[0], rights[0]
+    if abs(l - r) <= 4 and l > 3:
+        return "center"
+    if r < l - 3 and r < 8:
+        return "right"
+    return "left"
 
 
 def convert(src, dst, kind):
-    global FONT_NAME
+    import subprocess
+    import tempfile
     with pdfplumber.open(src) as pdf:
-        fonts = Counter()
-        for pg in pdf.pages[10:40]:
-            for ch in pg.chars[:400]:
-                fonts["Times New Roman" if "Times" in ch["fontname"] else "Arial"] += 1
-        FONT_NAME = fonts.most_common(1)[0][0] if fonts else "Arial"
         chapters = Chapters(kind, pdf)
         rng = os.environ.get("PAGES")
         sel = range(*map(int, rng.split("-"))) if rng else range(len(pdf.pages))
-        sheets = {}  # chapter -> list of parsed pages
-        order = []
+        sheets, order = {}, []
         for i in sel:
             pg = pdf.pages[i]
-            pg = pg.within_bbox((0, 0, pg.width, pg.height)).dedupe_chars()  # drop off-page objects
-            p = parse_page(pg, kind)
+            pg = pg.within_bbox((0, 0, pg.width, pg.height)).dedupe_chars()
+            p = parse_abs(pg, kind)
             chap = chapters.page(p["footer_text"], p["top_lines"])
             p["no"] = i + 1
             if p["scan"]:
-                # scanned page (no text layer): keep a picture of it
-                import subprocess
-                import tempfile
                 tmp = tempfile.mkdtemp(prefix="sorpage_")
-                subprocess.run(["pdftoppm", "-f", str(i + 1), "-l", str(i + 1), "-r", "110", "-png",
+                subprocess.run(["pdftoppm", "-f", str(i + 1), "-l", str(i + 1), "-r", "150", "-png",
                                 "-singlefile", src, os.path.join(tmp, "p")], check=True)
                 p["image"] = os.path.join(tmp, "p.png")
-                p["blocks"] = []
+            else:
+                p["img_paths"] = [crop(src, i + 1, b) for b in p["imgs"]]
+            normalise(p)
             if chap not in sheets:
                 sheets[chap] = []
                 order.append(chap)
@@ -948,38 +1955,42 @@ def convert(src, dst, kind):
 
     wb = Workbook()
     wb.remove(wb.active)
-    # default (Normal) font = the PDF's font, so column-width units match in Excel and LibreOffice
+    # Normal style = Arial 10 so that column-width units are 7 px everywhere
     normal = [st for st in wb._named_styles if st.name == "Normal"][0]
-    normal.font = Font(name=FONT_NAME, size=10)
-    wb._fonts[0] = Font(name=FONT_NAME, size=10)
-    used = set()
-    page_map = []
+    normal.font = Font(name="Arial", size=10)
+    wb._fonts[0] = Font(name="Arial", size=10)
+    used, page_map, groups = set(), [], []
     for chap in order:
-        ws = wb.create_sheet(sheet_title(chap, used))
-        w = SheetWriter(ws, chap, sheets[chap])
+        runs = []
         for p in sheets[chap]:
-            row0 = w.r
-            if p.get("image"):
-                w.image(p["image"])
-            for b in p["blocks"]:
-                if b["t"] == "text":
-                    if b["text"].strip():
-                        w.text(b)
-                elif b["t"] == "chunks":
-                    w.chunks(b["chunks"])
-                else:
-                    w.table(b)
-            if not p["footer"]:
-                p["footer"] = {"chunks": [(w.grid.right - 40, f"PDF page {p['no']}")]}
-            w.page_end(p["footer"])
-            page_map.append({"sheet": ws.title, "page": p["no"], "r0": row0, "r1": w.r - 1})
-        w.finish(chap)
+            if runs and runs[-1][0] == p["landscape"] and runs[-1][1][-1]["no"] == p["no"] - 1:
+                runs[-1][1].append(p)
+            else:
+                runs.append((p["landscape"], [p]))
+        for k, (land, rp) in enumerate(runs, start=1):
+            if len(runs) == 1:
+                name = chap
+            elif land:
+                name = f"{chap} (Landscape)"
+            else:
+                name = chap if k == 1 else f"{chap} ({k})"
+            groups.append((name, chap, rp, land))
+    for name, chap, pages, land in groups:
+        ws = wb.create_sheet(sheet_title(name, used))
+        tpl = footer_template(pages)
+        w = AbsWriter(ws, chap, pages, use_footer_rows=tpl is None)
+        for p in pages:
+            r0, r1 = w.page(p, p.get("image"))
+            page_map.append({"sheet": ws.title, "page": p["no"], "r0": r0, "r1": r1})
+        w.finish(land)
+        set_header_footer(ws, chap, pages, tpl)
     wb.save(dst)
     if os.environ.get("MAPFILE"):
         import json
         with open(os.environ["MAPFILE"], "w") as fh:
             json.dump(page_map, fh)
-    print(f"saved {dst}: {len(order)} sheets")
+    print(f"saved {dst}: {len(groups)} sheets")
+
 
 
 if __name__ == "__main__":

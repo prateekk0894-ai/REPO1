@@ -70,6 +70,15 @@ def main(pdf_path, xlsx_path, map_path):
                         v = f"{float(v):.2f}"
                     if isinstance(v, str):
                         xl_chars.update(ch for ch in v.lower() if ch.isalnum())
+            # page footer printed by Excel (footer sections with &P = page number)
+            idx = [x["page"] for x in pmap if x["sheet"] == m["sheet"]].index(m["page"])
+            first = ws.page_setup.firstPageNumber or 1
+            for part in (ws.oddFooter.left, ws.oddFooter.center, ws.oddFooter.right):
+                if part.text:
+                    t = part.text.replace("&P", str(first + idx)).replace("&&", "&")
+                    xl_chars.update(ch for ch in t.lower() if ch.isalnum())
+                    for tok in t.split():
+                        xl_tokens[norm(tok)] += 1
             found = sum((pdf_chars & xl_chars).values())
             total = sum(pdf_chars.values())
             cov = found / total if total else 1.0
