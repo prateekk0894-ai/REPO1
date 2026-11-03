@@ -120,6 +120,30 @@ def split_gaps(words, gap):
     return chunks
 
 
+def is_num_token(t):
+    return bool(re.fullmatch(r"[\d.,%/-]+", t)) and any(ch.isdigit() for ch in t)
+
+
+def split_table_line(words):
+    """Split a free-text line into cells: at big gaps, and - on lines that look like a
+    row of an un-ruled numeric table - also between numbers set a few points apart."""
+    nums = sum(is_num_token(w["text"]) for w in words)
+    gaps_num = sum(
+        1 for a, b in zip(words, words[1:])
+        if b["x0"] - a["x1"] >= 6 and (is_num_token(a["text"]) or is_num_token(b["text"]))
+    )
+    if nums >= 3 and gaps_num >= 3:
+        chunks = [[words[0]]]
+        for a, b in zip(words, words[1:]):
+            gap = b["x0"] - a["x1"]
+            if gap >= 25 or (gap >= 6 and (is_num_token(a["text"]) or is_num_token(b["text"]))):
+                chunks.append([b])
+            else:
+                chunks[-1].append(b)
+        return chunks
+    return split_gaps(words, 25)
+
+
 def inside(w, bbox):
     cx = (w["x0"] + w["x1"]) / 2
     cy = (w["top"] + w["bottom"]) / 2
@@ -204,10 +228,19 @@ def is_footer(line, page_h, kind):
 #   {"t": "table", "cells": [(r0, r1, x0, x1, text)], "nrows", "hdr", "numx"}
 
 
-def table_block(tbl):
+def cell_text(words, bb):
+    """Text of the PDF words whose centre lies inside the cell bbox, in reading order."""
+    inner = [w for w in words if inside(w, bb) and not w.get("_used")]
+    if not inner:
+        return None
+    for w in inner:
+        w["_used"] = True
+    return join_lines([ln["text"] for ln in group_lines(inner)])
+
+
+def table_block(tbl, words):
     rows = tbl.rows
     tops = [r.bbox[1] for r in rows] + [rows[-1].bbox[3]]
-    data = tbl.extract()
     cells = []
     for ri, row in enumerate(rows):
         for ci, bb in enumerate(row.cells):
@@ -217,9 +250,24 @@ def table_block(tbl):
             r1 = ri
             while r1 + 1 < len(rows) and tops[r1 + 1] < bb[3] - 2:
                 r1 += 1
-            txt = data[ri][ci] if ci < len(data[ri]) else None
-            txt = join_lines(txt.split("\n")) if txt else None
-            cells.append((ri, r1, bb[0], bb[2], txt))
+            txt = cell_text(words, bb)
+            cells.append([ri, r1, bb[0], bb[2], txt, bb])
+    # words that fell on a cell border: give them to the nearest cell
+    for w in words:
+        if w.get("_used"):
+            continue
+        cx, cy = (w["x0"] + w["x1"]) / 2, (w["top"] + w["bottom"]) / 2
+
+        def dist(c):
+            x0, y0, x1, y1 = c[5]
+            return max(x0 - cx, 0, cx - x1) + max(y0 - cy, 0, cy - y1)
+
+        if cells:
+            c = min(cells, key=dist)
+            if dist(c) <= 8:
+                c[4] = f"{c[4]} {w['text']}" if c[4] else w["text"]
+                w["_used"] = True
+    cells = [tuple(c[:5]) for c in cells]
     # header rows: leading rows with Item/Description/Unit/Rate or just numbers 1..n
     hdr = 0
     for ri in range(min(4, len(rows))):
@@ -273,6 +321,32 @@ def road_header(lines):
     return None, None
 
 
+def looks_numeric(t):
+    return bool(NUM_RE.match(t.strip()))
+
+
+def shift_group_rates(recs):
+    """Fix rates printed half a line too high in numbered groups.
+
+    Pattern in the PDF:  heading (rate a) / 1 .. (rate b) / 2 .. / ... / N .. (no rate).
+    Every rate belongs one row lower, so the heading carries none and N gets the last."""
+    i = 0
+    while i < len(recs) - 1:
+        h = recs[i]
+        if h["rate"] and not h["_mk"].isdigit() and recs[i + 1]["_mk"] == "1":
+            j = i + 1
+            while j + 1 < len(recs) and recs[j + 1]["_mk"] == str(int(recs[j]["_mk"]) + 1):
+                j += 1
+            grp = recs[i:j + 1]
+            if not grp[-1]["rate"] and not grp[-1]["unit"] and all(r["rate"] for r in grp[:-1]):
+                for k in range(len(grp) - 1, 0, -1):
+                    grp[k]["rate"], grp[k]["unit"] = grp[k - 1]["rate"], grp[k - 1]["unit"]
+                h["rate"], h["unit"] = [], []
+            i = j + 1
+        else:
+            i += 1
+
+
 def road_block(hdr, body, bounds, left, right):
     """Un-ruled road SOR item table -> table block with one record per item."""
     # Unit/rate words are often printed a few points above/below their text
@@ -316,9 +390,13 @@ def road_block(hdr, body, bounds, left, right):
             cx = (w["x0"] + w["x1"]) / 2
             if w["x1"] <= bounds["item"] + 2 and cx < bounds["item"]:
                 cells["item"].append(w)
-            elif cx >= bounds["rate"]:
+            elif cx >= bounds["rate"] and not (desc_words and not cells["unit"] and not looks_numeric(w["text"])
+                                               and w["x0"] - desc_words[-1]["x1"] < 6):
                 cells["rate"].append(w)
-            elif cx >= bounds["unit"]:
+            elif cx >= bounds["unit"] and not (desc_words and not cells["unit"]
+                                               and (w["x0"] - desc_words[-1]["x1"] < 6
+                                                    or desc_words[-1]["text"].endswith("-"))
+                                               and w["x0"] < bounds["unit"] + 4):
                 cells["unit"].append(w)
             else:
                 desc_words.append(w)
@@ -370,11 +448,13 @@ def road_block(hdr, body, bounds, left, right):
             cur["_marked"] = marked or bool(line["item"])
             cur["_bold"] = bold if zone else None
             cur["_top"] = ln["top"]
+            cur["_mk"] = zone[0]["text"] if (marked and zone) else ""
             recs.append(cur)
         for k in ROAD_COLS:
             if line[k]:
                 cur[k].append(line[k])
 
+    shift_group_rates(recs)
     cells = [(0, 0, xs["item"], xs["name"], "Item No."), (0, 0, xs["name"], xs["unit"], "Description"),
              (0, 0, xs["unit"], xs["rate"], "Unit"), (0, 0, xs["rate"], xs["end"], "Rate")]
     for i, rec in enumerate(recs, start=1):
@@ -396,7 +476,7 @@ def text_blocks(lines, page_w, right_margin):
     """Turn free text lines into merged paragraphs / chunk rows."""
     out = []
     for ln in lines:
-        chunks = split_gaps(ln["words"], 25)
+        chunks = split_table_line(ln["words"])
         mid = (ln["x0"] + ln["x1"]) / 2
         centered = abs(mid - page_w / 2) < 25 and (ln["x1"] - ln["x0"]) < page_w * 0.7 and ln["x0"] > 90
         if len(chunks) > 1 and not centered:
@@ -431,7 +511,17 @@ def text_blocks(lines, page_w, right_margin):
 
 def parse_page(pg, kind):
     tables = [t for t in pg.find_tables() if (t.bbox[3] - t.bbox[1]) > 15 and len(t.rows) >= 1]
-    words = pg.extract_words(x_tolerance=1.5, y_tolerance=3, extra_attrs=["fontname", "size"])
+    if kind == "road":
+        # simple Item/Description/Unit/Rate grids: the line-based reader handles them better
+        all_lines = group_lines(pg.extract_words(x_tolerance=1.5, y_tolerance=3))
+        hdr_ln, _ = road_header(all_lines)
+        if hdr_ln is not None:
+            tables = [t for t in tables if t.bbox[3] < hdr_ln["top"]]
+    words = pg.extract_words(x_tolerance=1.5, y_tolerance=3, return_chars=True)
+    for w in words:
+        chs = w.pop("chars")
+        w["fontname"] = Counter(c["fontname"] for c in chs).most_common(1)[0][0]
+        w["size"] = Counter(round(c["size"], 1) for c in chs).most_common(1)[0][0]
     free = [w for w in words if not any(inside(w, t.bbox) for t in tables)]
     lines = group_lines(free)
     footer = [ln for ln in lines if is_footer(ln, pg.height, kind)]
@@ -442,7 +532,12 @@ def parse_page(pg, kind):
     left = min(min(all_x0), min((t.bbox[0] for t in tables), default=999))
     right = max(max(all_x1), max((t.bbox[2] for t in tables), default=0))
 
-    blocks = [table_block(t) for t in tables]
+    blocks = [table_block(t, [w for w in words if inside(w, t.bbox)]) for t in tables]
+    # words inside a table frame but in no cell (e.g. un-ruled rows below the grid) are free text
+    leftover = [w for w in words if not w.get("_used") and any(inside(w, t.bbox) for t in tables)]
+    if leftover:
+        lines = sorted(lines + [ln for ln in group_lines(leftover) if not is_footer(ln, pg.height, kind)],
+                       key=lambda l: l["top"])
     if kind == "road":
         hdr, bounds = road_header(lines)
         if bounds:
@@ -461,6 +556,11 @@ def parse_page(pg, kind):
             # stray second header line ("No.")
             body = [ln for ln in body if not (ln["top"] - hdr["top"] < 14 and ln["text"].strip() in ("No.", "(Rs.)"))]
             above = [ln for ln in lines if ln["top"] < hdr["top"] - 2]
+            titles = [ln for ln in body if ln["size"] >= 13]
+            body = [ln for ln in body if ln["size"] < 13]
+            above += titles
+            if titles and not body and "words" in hdr:
+                above.append(hdr)  # title page: keep the printed table header as a line
             if body:
                 blocks.append(road_block(hdr, body, bounds, left, max(right, hdr["x1"] + 8)))
             lines = above
@@ -473,8 +573,16 @@ def parse_page(pg, kind):
         fl = sorted(footer, key=lambda l: l["top"])
         footer_blk = {"t": "footer", "chunks": [(c[0]["x0"], fix_text(" ".join(w["text"] for w in c)))
                                                  for ln in fl for c in split_gaps(ln["words"], 25)]}
+    hdr_words = {"Item", "No.", "Description", "Unit", "Rate", "S.No.", "(Rs.)"}
+    body_words = sum(1 for ln in lines for w in ln["words"] if w["text"] not in hdr_words) + sum(
+        1 for b in blocks if b["t"] == "table" for c in b["cells"]
+        if c[4] and c[4] not in ("Item No.", "Description", "Unit", "Rate"))
+    img_area = sum(max(0, im["x1"] - im["x0"]) * max(0, im["bottom"] - im["top"]) for im in pg.images)
+    page_area = pg.width * pg.height
+    # scanned page (no text layer) or a picture cover page with only a few words
+    scan = (body_words == 0 and img_area > 0.1 * page_area) or (body_words < 40 and img_area > 0.7 * page_area)
     return {"blocks": blocks, "footer": footer_blk, "footer_text": footer_text, "top_lines": top_lines,
-            "left": left, "right": right, "width": pg.width}
+            "left": left, "right": right, "width": pg.width, "scan": scan}
 
 
 # ---------------------------------------------------------------- grid
@@ -489,6 +597,18 @@ def cluster(xs, tol=4.0):
     return [sum(g) / len(g) for g in groups]
 
 
+def cluster_counts(xs, tol=4.0, min_n=3):
+    """Centres of x clusters that occur at least min_n times."""
+    xs = sorted(xs)
+    groups = []
+    for x in xs:
+        if groups and x - groups[-1][0] <= tol:
+            groups[-1].append(x)
+        else:
+            groups.append([x])
+    return [min(g) for g in groups if len(g) >= min_n]
+
+
 class Grid:
     def __init__(self, pages):
         xs = []
@@ -497,6 +617,14 @@ class Grid:
                 if b["t"] == "table":
                     for c in b["cells"]:
                         xs += [c[2], c[3]]
+        # repeated start positions of gap-separated text (un-ruled tables) become columns too
+        starts = []
+        for p in pages:
+            for b in p["blocks"]:
+                if b["t"] == "chunks":
+                    starts += [x for x, *_ in b["chunks"]]
+        for c in cluster_counts(starts):
+            xs.append(c)
         lefts = [p["left"] for p in pages]
         rights = [p["right"] for p in pages]
         self.left = min(lefts) if lefts else 40
@@ -588,8 +716,11 @@ def lines_needed(text, width_pt, size, bold=False):
     return n
 
 
+MIN_ROW = 13.5
+
+
 def row_h(lines, size):
-    return lines * size * 1.18 + 3
+    return lines * size * 1.17 + 2
 
 
 class SheetWriter:
@@ -599,18 +730,20 @@ class SheetWriter:
         self.pages = pages
         self.r = 1
         self.need = {}  # row -> required height (pt)
+        self.page_rows = []  # (first row, last row) of each PDF page
+        self.page_r0 = 1
         self.vneed = []  # (r0, r1, height) for vertically merged cells
         g = self.grid
         for c in range(1, g.ncols + 1):
             pt = g.width_pt(c, c)
-            ws.column_dimensions[get_column_letter(c)].width = max(round((pt / 0.75 - 5) / 7, 2), 0.8)
+            ws.column_dimensions[get_column_letter(c)].width = max(round(pt / 0.75 / 7, 2), 0.5)  # OOXML width includes padding
 
     def _merge(self, r0, r1, c0, c1):
         if r1 > r0 or c1 > c0:
             self.ws.merge_cells(start_row=r0, start_column=c0, end_row=r1, end_column=c1)
 
     def _height(self, r, h):
-        self.need[r] = max(self.need.get(r, 15), h)
+        self.need[r] = max(self.need.get(r, MIN_ROW), h)
 
     def text(self, b):
         g = self.grid
@@ -636,7 +769,8 @@ class SheetWriter:
         for i in range(1, len(cols)):
             if cols[i] <= cols[i - 1]:
                 cols[i] = min(cols[i - 1] + 1, g.ncols)
-        h = 15
+        h = MIN_ROW
+        dec_row = sum(bool(re.fullmatch(r"\d+\.\d+", c[1].strip())) for c in chunks) >= 3 and not small
         for i, ch in enumerate(chunks):
             c0 = cols[i]
             if i and c0 <= cols[i - 1]:
@@ -647,7 +781,9 @@ class SheetWriter:
             c1 = (cols[i + 1] - 1) if i + 1 < len(chunks) else g.ncols
             c1 = max(c1, c0)
             bold = ch[2] if len(ch) > 2 else False
-            cell = self.ws.cell(self.r, c0, to_number(ch[1]) if looks_like_rate(ch[1]) else ch[1])
+            is_dec = bool(re.fullmatch(r"\d+\.\d+", ch[1].strip()))
+            cell = self.ws.cell(self.r, c0, to_number(ch[1]) if (looks_like_rate(ch[1]) or (is_dec and dec_row))
+                                else ch[1])
             if isinstance(cell.value, (int, float)):
                 cell.number_format = RUPEE_FMT
             cell.font = font(8 if small else 10, bold, color)
@@ -662,20 +798,27 @@ class SheetWriter:
         g = self.grid
         base = self.r
         hdr = b["hdr"]
-        occupied = set()
+        occupied = {}
         for (r0, r1, x0, x1, txt) in b["cells"]:
             c0, c1 = g.col_at(x0), g.col_end(x1)
             if c1 < c0:
                 c1 = c0
             R0, R1 = base + r0, base + r1
             if any((rr, cc) in occupied for rr in range(R0, R1 + 1) for cc in range(c0, c1 + 1)):
-                # overlapping after snapping: write into first free cell only
+                # overlapping after snapping: never lose text
                 if (R0, c0) in occupied:
+                    if txt:
+                        anchor = occupied[(R0, c0)]
+                        cell = self.ws.cell(*anchor)
+                        cell.value = f"{cell.value} {txt}" if cell.value not in (None, "") else (
+                            to_number(txt) if looks_like_rate(txt) else txt)
+                        if isinstance(cell.value, (int, float)):
+                            cell.number_format = RUPEE_FMT
                     continue
                 c1, R1 = c0, R0
             for rr in range(R0, R1 + 1):
                 for cc in range(c0, c1 + 1):
-                    occupied.add((rr, cc))
+                    occupied[(rr, cc)] = (R0, c0)
                     self.ws.cell(rr, cc).border = BORDER
             is_hdr = r0 < hdr
             val = txt
@@ -705,6 +848,23 @@ class SheetWriter:
                 self.vneed.append((R0, R1, h))
         self.r = base + b["nrows"]
 
+    def image(self, path):
+        """Place a picture of a scanned PDF page, sized to the sheet width."""
+        from openpyxl.drawing.image import Image as XLImage
+        img = XLImage(path)
+        g = self.grid
+        width_px = sum((self.ws.column_dimensions[get_column_letter(c)].width or 8.43) * 7
+                       for c in range(1, g.ncols + 1))
+        ratio = img.height / img.width
+        img.width = int(width_px * 0.97)
+        img.height = int(img.width * ratio)
+        self.ws.add_image(img, f"A{self.r}")
+        total_pt = img.height * 0.75
+        n = math.ceil(total_pt / 20)
+        for _ in range(n):
+            self._height(self.r, 20)
+            self.r += 1
+
     def page_end(self, footer):
         if footer:
             txt = "     ".join(t for _, t in footer["chunks"])
@@ -715,24 +875,38 @@ class SheetWriter:
             self._height(self.r, 14)
             self.r += 1
         self.ws.row_breaks.append(Break(id=self.r - 1))
+        self.page_rows.append((self.page_r0, self.r - 1))
+        self.page_r0 = self.r
 
     def finish(self, title):
         ws = self.ws
         for r0, r1, h in self.vneed:
-            have = sum(self.need.get(r, 15) for r in range(r0, r1 + 1))
+            have = sum(self.need.get(r, MIN_ROW) for r in range(r0, r1 + 1))
             if h > have:
-                self.need[r1] = self.need.get(r1, 15) + (h - have)
+                self.need[r1] = self.need.get(r1, MIN_ROW) + (h - have)
         for r, h in self.need.items():
             ws.row_dimensions[r].height = min(round(h, 1), 409)
         ws.sheet_view.showGridLines = False
         ws.print_title_rows = None
         ws.page_setup.orientation = "portrait"
         ws.page_setup.paperSize = ws.PAPERSIZE_A4
-        ws.sheet_properties.pageSetUpPr.fitToPage = True
-        ws.page_setup.fitToWidth = 1
-        ws.page_setup.fitToHeight = 0
+        ws.sheet_format.defaultRowHeight = MIN_ROW
+        ws.sheet_format.customHeight = True
         ws.page_margins.left = ws.page_margins.right = 0.4
         ws.page_margins.top = ws.page_margins.bottom = 0.5
+        # one print scale per sheet so that every PDF page fits on one printed page
+        g = self.grid
+        width_pt = sum(((ws.column_dimensions[get_column_letter(c)].width or 8.43) * 7) * 0.75
+                       for c in range(1, g.ncols + 1))
+        scale = min(1.0, (595 - 0.8 * 72) / width_pt)
+        avail = 842 - 72 - 18
+        for r0, r1 in self.page_rows:
+            h = sum(min(self.need.get(r, MIN_ROW), 409) for r in range(r0, r1 + 1))
+            if h * scale > avail:
+                scale = avail / h
+        ws.sheet_properties.pageSetUpPr.fitToPage = False
+        ws.page_setup.scale = max(10, int(scale * 100 * 0.95))  # 5% slack for font metric differences
+        ws.print_area = f"A1:{get_column_letter(g.ncols)}{max(ws.max_row, 1)}"
         ws.print_options.horizontalCentered = True
         ws.oddFooter.center.text = title
 
@@ -751,9 +925,20 @@ def convert(src, dst, kind):
         sheets = {}  # chapter -> list of parsed pages
         order = []
         for i in sel:
-            p = parse_page(pdf.pages[i].dedupe_chars(), kind)
+            pg = pdf.pages[i]
+            pg = pg.within_bbox((0, 0, pg.width, pg.height)).dedupe_chars()  # drop off-page objects
+            p = parse_page(pg, kind)
             chap = chapters.page(p["footer_text"], p["top_lines"])
             p["no"] = i + 1
+            if p["scan"]:
+                # scanned page (no text layer): keep a picture of it
+                import subprocess
+                import tempfile
+                tmp = tempfile.mkdtemp(prefix="sorpage_")
+                subprocess.run(["pdftoppm", "-f", str(i + 1), "-l", str(i + 1), "-r", "110", "-png",
+                                "-singlefile", src, os.path.join(tmp, "p")], check=True)
+                p["image"] = os.path.join(tmp, "p.png")
+                p["blocks"] = []
             if chap not in sheets:
                 sheets[chap] = []
                 order.append(chap)
@@ -763,11 +948,19 @@ def convert(src, dst, kind):
 
     wb = Workbook()
     wb.remove(wb.active)
+    # default (Normal) font = the PDF's font, so column-width units match in Excel and LibreOffice
+    normal = [st for st in wb._named_styles if st.name == "Normal"][0]
+    normal.font = Font(name=FONT_NAME, size=10)
+    wb._fonts[0] = Font(name=FONT_NAME, size=10)
     used = set()
+    page_map = []
     for chap in order:
         ws = wb.create_sheet(sheet_title(chap, used))
         w = SheetWriter(ws, chap, sheets[chap])
         for p in sheets[chap]:
+            row0 = w.r
+            if p.get("image"):
+                w.image(p["image"])
             for b in p["blocks"]:
                 if b["t"] == "text":
                     if b["text"].strip():
@@ -779,8 +972,13 @@ def convert(src, dst, kind):
             if not p["footer"]:
                 p["footer"] = {"chunks": [(w.grid.right - 40, f"PDF page {p['no']}")]}
             w.page_end(p["footer"])
+            page_map.append({"sheet": ws.title, "page": p["no"], "r0": row0, "r1": w.r - 1})
         w.finish(chap)
     wb.save(dst)
+    if os.environ.get("MAPFILE"):
+        import json
+        with open(os.environ["MAPFILE"], "w") as fh:
+            json.dump(page_map, fh)
     print(f"saved {dst}: {len(order)} sheets")
 
 
